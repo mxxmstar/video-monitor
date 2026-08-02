@@ -1,160 +1,118 @@
 <script setup lang="ts">
-import { ref } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { ref } from 'vue'
+import { useRouter } from 'vue-router'
+import {
+  HomeOutlined,
+  SettingOutlined,
+  CameraOutlined,
+  BellOutlined
+} from '@ant-design/icons-vue'
 
-const greetMsg = ref("");
-const name = ref("");
+const router = useRouter()
 
-async function greet() {
-  // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-  greetMsg.value = await invoke("greet", { name: name.value });
+const selectedKeys = ref(['home'])
+const openKeys = ref(['settings'])
+
+const handleMenuClick = (e: any) => {
+  if (e.key === 'home') {
+    router.push('/home')
+  } else if (e.key === 'video-source') {
+    router.push('/settings/video-source')
+  } else if (e.key === 'notification') {
+    router.push('/settings/notification')
+  }
 }
 </script>
 
 <template>
-  <main class="container">
-    <h1>Welcome to Tauri + Vue</h1>
+  <a-layout style="min-height: 100vh">
+    <a-layout-sider
+      :width="240"
+      theme="light"
+      style="background: #f5f0f3; border-right: 1px solid #e8e0e5"
+    >
+      <div style="padding: 20px 16px; border-bottom: 1px solid #e8e0e5">
+        <div style="display: flex; align-items: center; gap: 10px">
+          <div style="width: 32px; height: 32px; background: linear-gradient(135deg, #e8c4d8, #d4a5c5); border-radius: 8px; display: flex; align-items: center; justify-content: center">
+            <span style="color: white; font-size: 18px"></span>
+          </div>
+          <div>
+            <div style="font-size: 18px; font-weight: 600; color: #4a3f55">Video Monitor</div>
+            <div style="font-size: 12px; color: #8b7d96">视频监控智能平台</div>
+          </div>
+        </div>
+      </div>
 
-    <div class="row">
-      <a href="https://vite.dev" target="_blank">
-        <img src="/vite.svg" class="logo vite" alt="Vite logo" />
-      </a>
-      <a href="https://tauri.app" target="_blank">
-        <img src="/tauri.svg" class="logo tauri" alt="Tauri logo" />
-      </a>
-      <a href="https://vuejs.org/" target="_blank">
-        <img src="./assets/vue.svg" class="logo vue" alt="Vue logo" />
-      </a>
-    </div>
-    <p>Click on the Tauri, Vite, and Vue logos to learn more.</p>
+      <a-menu
+        v-model:selectedKeys="selectedKeys"
+        v-model:openKeys="openKeys"
+        mode="inline"
+        @click="handleMenuClick"
+        style="background: transparent; border: none; padding: 8px"
+      >
+        <a-menu-item key="home">
+          <HomeOutlined />
+          <span>首页</span>
+        </a-menu-item>
 
-    <form class="row" @submit.prevent="greet">
-      <input id="greet-input" v-model="name" placeholder="Enter a name..." />
-      <button type="submit">Greet</button>
-    </form>
-    <p>{{ greetMsg }}</p>
-  </main>
+        <a-sub-menu key="settings">
+          <template #title>
+            <span>
+              <SettingOutlined />
+              <span>设置</span>
+            </span>
+          </template>
+          <a-menu-item key="video-source">
+            <CameraOutlined />
+            <span>视频源管理</span>
+          </a-menu-item>
+          <a-menu-item key="notification">
+            <BellOutlined />
+            <span>通知管理</span>
+          </a-menu-item>
+        </a-sub-menu>
+      </a-menu>
+    </a-layout-sider>
+
+    <a-layout style="height: 100vh; display: flex; flex-direction: column">
+      <a-layout-header style="background: white; padding: 0 24px; display: flex; align-items: center; height: 56px; border-bottom: 1px solid #f0e8ed; flex-shrink: 0">
+        <div>
+          <div style="font-size: 18px; font-weight: 600; color: #4a3f55; line-height: 1.2">视频助手</div>
+          <div style="font-size: 13px; color: #8b7d96; line-height: 1.2">欢迎回来，admin</div>
+        </div>
+      </a-layout-header>
+
+      <a-layout-content style="padding: 24px; background: #faf7f9; overflow-y: auto; flex: 1">
+        <router-view />
+      </a-layout-content>
+    </a-layout>
+  </a-layout>
 </template>
 
-<style scoped>
-.logo.vite:hover {
-  filter: drop-shadow(0 0 2em #747bff);
-}
-
-.logo.vue:hover {
-  filter: drop-shadow(0 0 2em #249b73);
-}
-
-</style>
 <style>
-:root {
-  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-  font-size: 16px;
-  line-height: 24px;
-  font-weight: 400;
-
-  color: #0f0f0f;
-  background-color: #f6f6f6;
-
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  -webkit-text-size-adjust: 100%;
-}
-
-.container {
+body {
   margin: 0;
-  padding-top: 10vh;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  text-align: center;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
 }
 
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: 0.75s;
+.ant-menu-inline {
+  border-inline-end: none !important;
 }
 
-.logo.tauri:hover {
-  filter: drop-shadow(0 0 2em #24c8db);
+.ant-menu-item,
+.ant-menu-submenu-title {
+  border-radius: 8px !important;
+  margin: 4px 8px !important;
+  width: calc(100% - 16px) !important;
 }
 
-.row {
-  display: flex;
-  justify-content: center;
+.ant-menu-item-selected {
+  background: #e8d5e0 !important;
+  color: #4a3f55 !important;
 }
 
-a {
-  font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
+.ant-menu-item:hover,
+.ant-menu-submenu-title:hover {
+  background: #f0e8ed !important;
 }
-
-a:hover {
-  color: #535bf2;
-}
-
-h1 {
-  text-align: center;
-}
-
-input,
-button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
-  font-family: inherit;
-  color: #0f0f0f;
-  background-color: #ffffff;
-  transition: border-color 0.25s;
-  box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
-}
-
-button {
-  cursor: pointer;
-}
-
-button:hover {
-  border-color: #396cd8;
-}
-button:active {
-  border-color: #396cd8;
-  background-color: #e8e8e8;
-}
-
-input,
-button {
-  outline: none;
-}
-
-#greet-input {
-  margin-right: 5px;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    color: #f6f6f6;
-    background-color: #2f2f2f;
-  }
-
-  a:hover {
-    color: #24c8db;
-  }
-
-  input,
-  button {
-    color: #ffffff;
-    background-color: #0f0f0f98;
-  }
-  button:active {
-    background-color: #0f0f0f69;
-  }
-}
-
 </style>
