@@ -62,11 +62,12 @@ impl UserRepository for SqliteUserRepository {
         // 步骤2：插入新用户记录
         // query 用于执行不返回结果的 SQL（INSERT/UPDATE/DELETE）
         sqlx::query(
-            "INSERT INTO users (id, name, email, created_at) VALUES (?, ?, ?, ?)"
+            "INSERT INTO users (id, name, email, password, created_at) VALUES (?, ?, ?, ?, ?)"
         )
         .bind(&user.id.0)                     // 绑定用户 ID（UserId 内部的 String）
         .bind(&user.name)                     // 绑定用户名
         .bind(&user.email)                    // 绑定邮箱
+        .bind(&user.password)                 // 绑定密码
         .bind(user.created_at)                // 绑定创建时间
         .execute(&self.pool)                  // 执行 SQL，自动管理连接
         .await
@@ -89,10 +90,10 @@ impl UserRepository for SqliteUserRepository {
     /// - `Ok(None)`: 用户不存在
     /// - `Err(DomainError::DatabaseError)`: 数据库操作失败
     async fn find_by_id(&self, id: &str) -> Result<Option<User>, DomainError> {
-        // 查询用户记录，结果映射为四元组
+        // 查询用户记录，结果映射为五元组（包含 password）
         // query_as 的泛型参数指定了结果类型
-        let result = sqlx::query_as::<_, (String, String, String, chrono::DateTime<Utc>)>(
-            "SELECT id, name, email, created_at FROM users WHERE id = ?"
+        let result = sqlx::query_as::<_, (String, String, String, String, chrono::DateTime<Utc>)>(
+            "SELECT id, name, email, password, created_at FROM users WHERE id = ?"
         )
         .bind(id)                             // 绑定查询参数
         .fetch_optional(&self.pool)           // 执行查询（可能返回 None）
@@ -101,13 +102,14 @@ impl UserRepository for SqliteUserRepository {
         
         // 处理查询结果
         match result {
-            Some((id, name, email, created_at)) => {
+            Some((id, name, email, password, created_at)) => {
                 // 找到用户，将数据库记录转换为领域实体
                 log_info!("User {} found", id);
                 Ok(Some(User {
                     id: UserId(id),           // 包装为 UserId 类型
                     name,                     // 字段名相同可简写
                     email,
+                    password,
                     created_at: created_at.timestamp() as i64,  // 转换为时间戳
                 }))
             }
@@ -131,9 +133,9 @@ impl UserRepository for SqliteUserRepository {
     /// - `Ok(None)`: 该邮箱未注册
     /// - `Err(DomainError::DatabaseError)`: 数据库操作失败
     async fn find_by_email(&self, email: &str) -> Result<Option<User>, DomainError> {
-        // 按邮箱查询用户记录
-        let result = sqlx::query_as::<_, (String, String, String, chrono::DateTime<Utc>)>(
-            "SELECT id, name, email, created_at FROM users WHERE email = ?"
+        // 按邮箱查询用户记录（包含 password 字段）
+        let result = sqlx::query_as::<_, (String, String, String, String, chrono::DateTime<Utc>)>(
+            "SELECT id, name, email, password, created_at FROM users WHERE email = ?"
         )
         .bind(email)                          // 绑定邮箱参数
         .fetch_optional(&self.pool)           // 执行查询
@@ -142,13 +144,14 @@ impl UserRepository for SqliteUserRepository {
         
         // 处理查询结果
         match result {
-            Some((id, name, email, created_at)) => {
+            Some((id, name, email, password, created_at)) => {
                 // 找到用户，转换为领域实体
                 log_info!("email {} found", email);
                 Ok(Some(User {
                     id: UserId(id),
                     name,
                     email,
+                    password,
                     created_at: created_at.timestamp() as i64,
                 }))
             }
@@ -177,6 +180,7 @@ mod tests {
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 email TEXT NOT NULL UNIQUE,
+                password TEXT NOT NULL,
                 created_at DATETIME NOT NULL
             )"
         )
@@ -195,6 +199,7 @@ mod tests {
             id: UserId("test-1".to_string()),
             name: "Test User".to_string(),
             email: "test@example.com".to_string(),
+            password: "hashed_password".to_string(),
             created_at: Utc::now().timestamp() as i64,
         };
         
@@ -213,6 +218,7 @@ mod tests {
             id: UserId("test-1".to_string()),
             name: "User 1".to_string(),
             email: "duplicate@example.com".to_string(),
+            password: "password1".to_string(),
             created_at: Utc::now().timestamp() as i64,
         };
         
@@ -222,6 +228,7 @@ mod tests {
             id: UserId("test-2".to_string()),
             name: "User 2".to_string(),
             email: "duplicate@example.com".to_string(),
+            password: "password2".to_string(),
             created_at: Utc::now().timestamp() as i64,
         };
         
@@ -243,6 +250,7 @@ mod tests {
             id: UserId("find-by-id-test".to_string()),
             name: "Find Me".to_string(),
             email: "findme@example.com".to_string(),
+            password: "secret".to_string(),
             created_at: Utc::now().timestamp() as i64,
         };
         
@@ -274,6 +282,7 @@ mod tests {
             id: UserId("find-email-test".to_string()),
             name: "Email Test".to_string(),
             email: "searchme@example.com".to_string(),
+            password: "secret".to_string(),
             created_at: Utc::now().timestamp() as i64,
         };
         
@@ -304,6 +313,7 @@ mod tests {
             id: UserId("integration-test".to_string()),
             name: "Integration Test".to_string(),
             email: "integration@example.com".to_string(),
+            password: "test_password".to_string(),
             created_at: Utc::now().timestamp() as i64,
         };
         

@@ -6,6 +6,15 @@ pub enum DomainError {
     #[error("Invalid user name: {0}")]
     InvalidName(String),
     
+    #[error("Invalid email format: {0}")]
+    InvalidEmail(String),
+    
+    #[error("Password is too short: {0}")]
+    PasswordTooShort(String),
+    
+    #[error("Password and confirm password do not match: {0}")]
+    PasswordMismatch(String),
+
     #[error("Email already exists: {0}")]
     EmailAlreadyExists(String),
     
