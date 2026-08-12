@@ -29,3 +29,34 @@ tracing-subscriber = { version = "0.3", features = ["json", "time", "env-filter"
 tracing-appender = "0.2"
 anyhow = "1"
 time = { version = "0.3", features = ["formatting"] }
+
+# ========== HTTP 服务框架 ==========
+# axum 是基于 tokio + hyper 的 Web 框架，由 tokio 团队维护
+# features 说明：
+#   - macros: 提供 #[debug_handler] 等宏
+#   - json: 支持 JSON 请求/响应自动序列化
+axum = { version = "0.7", features = ["macros", "json"] }
+
+# ========== HTTP 工具库 ==========
+# tower 提供 Service / Layer 抽象，是 axum 中间件的基础
+tower = "0.5"
+# tower-http 提供常用的 HTTP 中间件（日志、CORS、压缩等）
+tower-http = { version = "0.6", features = ["trace", "cors", "fs"] }
+
+# ========== UUID 生成 ==========
+# 用于生成请求 ID
+uuid = { version = "1", features = ["v4"] }
+
+# ========== 数据库 ==========
+# tokio 异步运行时
+tokio = { version = "1", features = ["full"] }
+# sqlx 是编译时检查的异步 SQL 工具包
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono"] }
+# chrono 时间处理
+chrono = { version = "0.4", features = ["serde"] }
+
+# ========== 工具库 ==========
+# async_trait 用于定义异步 trait
+async-trait = "0.1"
+# thiserror 用于简化错误定义
+thiserror = "2"
