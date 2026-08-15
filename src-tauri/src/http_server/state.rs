@@ -9,7 +9,12 @@ use crate::domain::entities::User;
 use crate::infrastructure::database::DatabaseConnection;
 use crate::infrastructure::repository::SqliteUserRepository;
 
+pub const CODE_SUCCESS: i32 = 0;
+pub const CODE_USER_CREATED: i32 = 10001;
+
+
 /// 应用状态，包含所有依赖
+#[derive(Clone)]
 pub struct AppState {
     pub db: Arc<DatabaseConnection>,
     pub create_user_use_case: Arc<CreateUserUseCase<SqliteUserRepository>>,
@@ -65,25 +70,30 @@ impl From<User> for UserResponse {
 /// API统一响应格式
 #[derive(Serialize)]
 pub struct ApiResponse<T> {
-    pub success: bool,
+    /// 业务状态码：0 表示成功，非 0 表示错误
+    pub code: i32,
+    /// 提示信息
+    pub message: String,
+    /// 响应数据（成功时有值，失败时为 None）
     pub data: Option<T>,
-    pub error: Option<String>,
 }
 
 impl<T> ApiResponse<T> {
+    /// 成功响应
     pub fn success(data: T) -> Self {
         Self {
-            success: true,
+            code: CODE_SUCCESS,
+            message: "success".into(),
             data: Some(data),
-            error: None,
         }
     }
     
-    pub fn error(message: String) -> Self {
+    /// 错误响应
+    pub fn error(code: i32, message: String) -> Self {
         Self {
-            success: false,
+            code,
+            message,
             data: None,
-            error: Some(message),
         }
     }
 }
@@ -92,7 +102,7 @@ impl<T> ApiResponse<T> {
 pub async fn create_user(
     State(state): State<Arc<AppState>>,
     Json(request): Json<CreateUserRequest>,
-) -> Result<Json<ApiResponse<UserResponse>>, StatusCode> {
+) -> Json<ApiResponse<UserResponse>> {
     // 1. DTO → Command
     let command = CreateUserCommand {
         name: request.name,
@@ -101,18 +111,21 @@ pub async fn create_user(
     };
     
     // 2. 调用应用层用例
-    let user = state
-        .create_user_use_case
-        .execute(command)
-        .await
-        .map_err(|e| {
+    let user = match state.create_user_use_case.execute(command).await {
+        Ok(user) => user,
+        Err(e) => {
             tracing::error!("Failed to create user: {}", e);
-            StatusCode::BAD_REQUEST
-        })?;
+            let code = match e {
+                crate::domain::errors::DomainError::EmailAlreadyExists(_) => CODE_USER_CREATED,
+                _ => CODE_SUCCESS,
+            };
+            return Json(ApiResponse::error(code, e.to_string()));
+        }
+    };
     
     // 3. Domain → DTO
     let response = UserResponse::from(user);
     
     // 4. 返回HTTP响应
-    Ok(Json(ApiResponse::success(response)))
+    Json(ApiResponse::success(response))
 }

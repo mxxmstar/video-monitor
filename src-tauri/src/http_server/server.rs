@@ -13,14 +13,26 @@ use crate::http_server;
 /// - `Ok(())`: 服务器正常关闭
 /// - `Err(anyhow::Error)`: 服务器启动或运行失败
 pub async fn start_http_server() -> anyhow::Result<()> {
-    // 使用内存数据库（开发测试用）
-    let database_url = "sqlite::memory:";
+    // 使用项目目录存储数据库文件
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let db_path = std::path::Path::new(manifest_dir).join("users.db");
     
-    tracing::info!("Using in-memory SQLite database");
+    // 确保数据库文件存在（SQLite 需要文件已存在或能创建）
+    if !db_path.exists() {
+        std::fs::File::create(&db_path)
+            .map_err(|e| anyhow::anyhow!("Failed to create database file: {}", e))?;
+        tracing::info!("Created new database file at: {:?}", db_path);
+    }
+    
+    // 使用正斜杠格式
+    let db_path_str = db_path.to_string_lossy().replace('\\', "/");
+    let database_url = format!("sqlite:{}", db_path_str);
+    
+    tracing::info!("Database path: {}", db_path_str);
     
     // 1. 初始化应用状态（包含数据库连接）
     let state = Arc::new(
-        http_server::state::AppState::new(database_url)
+        http_server::state::AppState::new(&database_url)
             .await?
     );
     
