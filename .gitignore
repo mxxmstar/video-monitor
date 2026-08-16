@@ -22,3 +22,19 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# C++ Build directories
+src-cpp/build
+src-cpp/out
+src-cpp/*.vcxproj
+src-cpp/*.vcxproj.filters
+src-cpp/CMakeCache.txt
+src-cpp/CMakeFiles
+src-cpp/cmake_install.cmake
+src-cpp/Makefile
+src-cpp/*.dll
+src-cpp/*.exe
+src-cpp/*.lib
+src-cpp/*.pdb
+.vs/*
+.vscode/*
