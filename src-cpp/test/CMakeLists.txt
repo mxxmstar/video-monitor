@@ -1,7 +1,7 @@
-# 测试 CMakeLists.txt
+# 通用测试 CMakeLists.txt
 
-# 收集所有测试源文件
-file(GLOB_RECURSE TEST_SOURCES "*.cpp")
+# 媒体测试由 test/media/CMakeLists.txt 独立管理。
+file(GLOB TEST_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/common/*.cpp")
 
 # 为每个测试文件创建可执行文件
 foreach(test_file ${TEST_SOURCES})
@@ -26,17 +26,7 @@ foreach(test_file ${TEST_SOURCES})
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/tests"
     )
     
-    # 复制 Boost DLL 到输出目录（Windows）
-    if(WIN32)
-        add_custom_command(TARGET ${test_target} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${DEFAULT_DEPS_ROOT}/debug/bin/boost_process-vc145-mt-gd-x64-1_91.dll"
-                $<TARGET_FILE_DIR:${test_target}>
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${DEFAULT_DEPS_ROOT}/debug/bin/boost_filesystem-vc145-mt-gd-x64-1_91.dll"
-                $<TARGET_FILE_DIR:${test_target}>
-        )
-    endif()
+    copy_runtime_dependencies(${test_target})
     
     # 注册测试
     add_test(NAME ${test_target}
@@ -44,3 +34,7 @@ foreach(test_file ${TEST_SOURCES})
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     )
 endforeach()
+
+if(BUILD_MEDIA_TESTS)
+    add_subdirectory(media)
+endif()
