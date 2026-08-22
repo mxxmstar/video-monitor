@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <limits>
 #include <thread>
 #include <utility>
 
@@ -159,8 +161,8 @@ bool MediaStreamSession::tryReconnect(int& reconnect_attempts) {
         ReconnectPolicy reconnect_config;
         InputEndpointConfig endpoint;
         {
-            // Setter 只允许在 Session 未运行时修改配置，因此在这里复制一份
-            // 快照，避免重连过程中反复读取可变配置。
+            // 将本次尝试需要的配置复制为快照，保证一次退避计算和 Open()
+            // 使用同一份 endpoint / 重连策略。
             std::lock_guard<std::mutex> lock(lifecycle_mutex_);
             if (!running_.load()) {
                 return false;
@@ -183,19 +185,24 @@ bool MediaStreamSession::tryReconnect(int& reconnect_attempts) {
             ++stats_.reconnect_count;
         }
 
-        // 本阶段先使用固定的 initial_delay。multiplier、max_delay 和
-        // reset_after_stable 留到后续退避策略阶段实现。
-        if (reconnect_config.initial_delay.count() > 0) {
-            std::this_thread::sleep_for(reconnect_config.initial_delay);
-        }
-        if (!running_.load()) {
+        const std::chrono::milliseconds delay =
+            reconnectDelay(reconnect_config, reconnect_attempts);
+        if (!waitForReconnectDelay(delay)) {
             return false;
         }
 
         // ReadPacket() 已经返回，因此此时可以关闭上一代底层连接，再用
-        // 同一个 Puller 和同一个 endpoint 建立新的连接。
-        puller_->Close();
-        const PullOpenResult open_result = puller_->Open(endpoint);
+        // 同一个 Puller 和同一个 endpoint 建立新的连接。与 Stop() 共用
+        // lifecycle_mutex_，避免 Close() 和 Open() 并发访问同一个 Puller。
+        PullOpenResult open_result;
+        {
+            std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+            if (!running_.load()) {
+                return false;
+            }
+            puller_->Close();
+            open_result = puller_->Open(endpoint);
+        }
 
         // Stop() 可能与 Open() 并发发生。若 Stop 已经生效，不能再发布
         // 重连成功或 StreamInfo，立即释放刚打开的资源。
@@ -229,11 +236,63 @@ bool MediaStreamSession::tryReconnect(int& reconnect_attempts) {
     return false;
 }
 
+std::chrono::milliseconds MediaStreamSession::reconnectDelay(
+    const ReconnectPolicy& config, int reconnect_attempt) {
+    if (config.initial_delay.count() <= 0) {
+        return std::chrono::milliseconds::zero();
+    }
+
+    // 第一次重连等待 initial_delay；第二次及以后再逐次乘 multiplier。
+    // 非法或小于 1 的 multiplier 会退化为 1，保证延迟不会因错误配置变小。
+    const double multiplier = std::isfinite(config.multiplier)
+        ? std::max(config.multiplier, 1.0)
+        : 1.0;
+    const int multiplier_count = std::max(reconnect_attempt - 1, 0);
+
+    long double delay_ms = static_cast<long double>(config.initial_delay.count());
+    const long double max_duration = static_cast<long double>(
+        (std::numeric_limits<std::chrono::milliseconds::rep>::max)());
+    for (int index = 0; index < multiplier_count && delay_ms < max_duration;
+         ++index) {
+        delay_ms = std::min(delay_ms * multiplier, max_duration);
+    }
+
+    // max_delay 为正时才启用上限；非正值按“不额外封顶”处理，避免把
+    // 误配的 0 解释成完全跳过等待。
+    if (config.max_delay.count() > 0) {
+        delay_ms = std::min(
+            delay_ms,
+            static_cast<long double>(config.max_delay.count()));
+    }
+
+    return std::chrono::milliseconds(static_cast<std::chrono::milliseconds::rep>(delay_ms));
+}
+
+bool MediaStreamSession::waitForReconnectDelay(
+    std::chrono::milliseconds delay) {
+    if (delay.count() <= 0) {
+        return running_.load();
+    }
+
+    std::unique_lock<std::mutex> lock(reconnect_wait_mutex_);
+    const bool stopped = reconnect_wait_cv_.wait_for(
+        lock,
+        delay,
+        [this] {
+            return !running_.load();
+        });
+    return !stopped;
+}
+
 void MediaStreamSession::Stop() {
+    // 先修改原子状态并唤醒退避等待。不能等到拿到 lifecycle_mutex_ 后
+    // 再通知，否则 Open() 期间的锁竞争会推迟等待线程退出。
+    running_.store(false);
+    reconnect_wait_cv_.notify_all();
+
     std::thread thread_to_join;
     {
         std::lock_guard<std::mutex> lock(lifecycle_mutex_);
-        running_.store(false);
         if (puller_) {
             puller_->Close();
         }
@@ -252,8 +311,25 @@ void MediaStreamSession::Stop() {
 
 void MediaStreamSession::readLoop() {
     int reconnect_attempts = 0;
+    auto connected_since = std::chrono::steady_clock::now();
 
     while (running_.load()) {
+        // reconnect_attempts 是当前稳定连接周期内的重连预算。连接持续
+        // 稳定达到 reset_after_stable 后，只清零本地预算，不清零累计统计。
+        ReconnectPolicy reconnect_config;
+        {
+            std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+            reconnect_config = session_config_.reconnect;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (reconnect_attempts > 0 &&
+            reconnect_config.reset_after_stable.count() > 0 &&
+            now - connected_since >= reconnect_config.reset_after_stable) {
+            reconnect_attempts = 0;
+            connected_since = now;
+            LOG_INFO("Session reconnect budget reset after stable connection");
+        }
+
         const PullReadResult result = puller_->ReadPacket();
 
         if (!running_.load()) {
@@ -299,6 +375,9 @@ void MediaStreamSession::readLoop() {
                 const bool retryable =
                     result.error.has_value() && result.error->retryable;
                 if (retryable && tryReconnect(reconnect_attempts)) {
+                    // tryReconnect() 返回 true 代表已经成功建立了新的
+                    // 连接代次，稳定计时应从这一刻重新开始。
+                    connected_since = std::chrono::steady_clock::now();
                     break;
                 }
 

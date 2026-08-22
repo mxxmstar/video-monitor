@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -90,6 +91,8 @@ public:
 private:
     void readLoop();
     bool tryReconnect(int& reconnect_attempts);
+    static std::chrono::milliseconds reconnectDelay(const ReconnectPolicy& config, int reconnect_attempt);
+    bool waitForReconnectDelay(std::chrono::milliseconds delay);
     void notifyStreamInfo();
     void setState(State state);
 
@@ -102,6 +105,11 @@ private:
     std::atomic<bool> running_{false};  ///< 是否正在运行 ReadLoop
     std::thread read_thread_; ///< 读线程，负责从 puller 读取数据
     mutable std::mutex lifecycle_mutex_; ///< 生命周期互斥锁，用于保护 state_ 和 running_
+
+    // 重连退避等待专用的条件变量。Stop() 设置 running_ 为 false 后通知它，
+    // 使读线程无需等待完整退避时间即可退出。
+    std::mutex reconnect_wait_mutex_;
+    std::condition_variable reconnect_wait_cv_;
 
     mutable std::mutex stats_mutex_; ///< 统计信息互斥锁，用于保护 stats_
     Stats stats_;                    ///< 会话统计信息

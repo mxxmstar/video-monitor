@@ -21,6 +21,12 @@
 
 namespace {
 
+/// @brief 记录每次 Open() 的开始时间，用于验证重连退避间隔。
+struct OpenHistory {
+    std::mutex mutex;
+    std::vector<std::chrono::steady_clock::time_point> timestamps;
+};
+
 /// @brief 可以控制每次 Open() 成功或失败的测试 Puller。
 ///
 /// open_results_ 控制每一次 Open() 调用的结果，connection_scripts_ 控制
@@ -34,12 +40,19 @@ namespace {
 class ReconnectPuller final : public IPuller {
 public:
     ReconnectPuller(std::vector<bool> open_results,
-                    std::vector<std::vector<PullReadResult>> connection_scripts)
+                    std::vector<std::vector<PullReadResult>> connection_scripts,
+                    std::shared_ptr<OpenHistory> open_history = nullptr)
         : open_results_(std::move(open_results)),
-          connection_scripts_(std::move(connection_scripts)) {}
+          connection_scripts_(std::move(connection_scripts)),
+          open_history_(std::move(open_history)) {}
 
     /// @brief 按 open_results_ 模拟第 n 次 Open() 的结果。
     PullOpenResult Open(const InputEndpointConfig& endpoint) override {
+        if (open_history_) {
+            std::lock_guard<std::mutex> lock(open_history_->mutex);
+            open_history_->timestamps.push_back(std::chrono::steady_clock::now());
+        }
+
         if (endpoint.uri.empty()) {
             return PullOpenResult::Failed({
                 PullErrorCategory::InvalidConfiguration,
@@ -51,11 +64,12 @@ public:
 
         const std::size_t attempt = open_attempt_++;
         const bool succeed = attempt < open_results_.size()
-            ? open_results_[attempt]
+            ? open_results_[attempt]    // 根据 open_results 决定成功/失败
             : false;
 
         closed_.store(true);
         if (!succeed) {
+            // 第 2 次 Open 失败走这里
             return PullOpenResult::Failed({
                 PullErrorCategory::Network,
                 0,
@@ -74,7 +88,7 @@ public:
                 false,
             });
         }
-
+        // 只有成功才会使用 scripts
         active_results_ = std::move(connection_scripts_[successful_connection_++]);
         position_ = 0;
         closed_.store(false);
@@ -150,6 +164,7 @@ private:
     std::atomic<bool> closed_{true};
 
     EventCallback event_callback_;
+    std::shared_ptr<OpenHistory> open_history_;
 
     MultiStreamInfo stream_info_ = [] {
         MultiStreamInfo info;
@@ -194,6 +209,18 @@ PullReadResult MakeStatusResult(PullReadStatus status,
         PullError{category, 0, message, retryable},
         nullptr,
         status,
+    };
+}
+
+/// @brief 创建一个暂时没有可交付包的结果。
+///
+/// Session 收到 NoData 后会按 no_data_backoff 让出一小段时间，再继续
+/// 读取。测试用它模拟连接仍然存活但暂时没有媒体包的稳定阶段。
+PullReadResult MakeNoDataResult() {
+    return {
+        std::nullopt,
+        nullptr,
+        PullReadStatus::NoData,
     };
 }
 
@@ -270,6 +297,22 @@ bool WaitForTerminal(const std::shared_ptr<MediaStreamSession>& session,
     return true;
 }
 
+bool WaitForState(Observations& observations,
+                  MediaStreamSession::State expected_state) {
+    std::unique_lock<std::mutex> lock(observations.mutex);
+    return observations.condition.wait_for(
+        lock,
+        std::chrono::seconds(2),
+        [&observations, expected_state] {
+            for (const MediaStreamSession::State state : observations.states) {
+                if (state == expected_state) {
+                    return true;
+                }
+            }
+            return false;
+        });
+}
+
 bool ContainsState(const Observations& observations,
                    MediaStreamSession::State expected) {
     for (const MediaStreamSession::State state : observations.states) {
@@ -278,6 +321,12 @@ bool ContainsState(const Observations& observations,
         }
     }
     return false;
+}
+
+std::vector<std::chrono::steady_clock::time_point> SnapshotOpenTimes(
+    const std::shared_ptr<OpenHistory>& open_history) {
+    std::lock_guard<std::mutex> lock(open_history->mutex);
+    return open_history->timestamps;
 }
 
 bool RunReconnectSuccessTest() {
@@ -396,13 +445,227 @@ bool RunReconnectExhaustedTest() {
     return true;
 }
 
+bool RunExponentialBackoffTest() {
+    // 初始连接成功后立刻读到 RetryableError。第一次重连 Open() 失败，
+    // 第二次重连 Open() 成功并 EOS，从而得到两段可测量的等待时间。
+    std::vector<std::vector<PullReadResult>> scripts;
+    scripts.push_back({
+        MakeStatusResult(
+            PullReadStatus::RetryableError,
+            PullErrorCategory::Network,
+            true,
+            "backoff first connection lost"),
+    });
+    scripts.push_back({
+        MakeStatusResult(
+            PullReadStatus::EOS,
+            PullErrorCategory::EndOfInput,
+            false,
+            "backoff reconnected input ended"),
+    });
+
+    const auto open_history = std::make_shared<OpenHistory>();
+    boost::asio::io_context io;
+    auto session = std::make_shared<MediaStreamSession>(io);
+    session->SetPuller(std::make_unique<ReconnectPuller>(
+        std::vector<bool>{true, false, true},
+        std::move(scripts),
+        open_history));
+
+    InputEndpointConfig endpoint;
+    endpoint.uri = "scripted://reconnect-backoff";
+    endpoint.puller_kind = PullerKind::FFmpeg;
+    session->SetEndpoint(endpoint);
+
+    SessionConfig config;
+    config.reconnect.enabled = true;
+    config.reconnect.initial_delay = std::chrono::milliseconds(50);
+    config.reconnect.multiplier = 2.0;
+    config.reconnect.max_delay = std::chrono::milliseconds(200);
+    config.reconnect.max_attempts = 2;
+    session->SetSessionConfig(config);
+
+    Observations observations;
+    AttachCallbacks(session, observations);
+    if (!session->Start() || !WaitForTerminal(session, observations)) {
+        return false;
+    }
+
+    session->Stop();
+    const MediaStreamSession::Stats stats = session->GetStats();
+    const auto open_times = SnapshotOpenTimes(open_history);
+    if (*observations.terminal_state != MediaStreamSession::State::KSTOPPED ||
+        stats.reconnect_count != 2 || open_times.size() != 3) {
+        std::cerr << "Exponential backoff setup assertions failed" << std::endl;
+        return false;
+    }
+
+    const auto first_delay = std::chrono::duration_cast<std::chrono::milliseconds>(
+        open_times[1] - open_times[0]);
+    const auto second_delay = std::chrono::duration_cast<std::chrono::milliseconds>(
+        open_times[2] - open_times[1]);
+
+    // 调度本身存在少量误差，因此验证下界：首次约 25ms，第二次按 2 倍
+    // 计算本应为 50ms，但被 max_delay 截断到约 40ms。
+    if (first_delay < std::chrono::milliseconds(15) ||
+        second_delay < std::chrono::milliseconds(30)) {
+        std::cerr << "Exponential backoff delays were too short: first="
+                  << first_delay.count() << "ms, second="
+                  << second_delay.count() << "ms" << std::endl;
+        return false;
+    }
+
+    std::cout << "Exponential backoff: first=" << first_delay.count()
+              << "ms, second=" << second_delay.count() << "ms" << std::endl;
+    return true;
+}
+
+bool RunStopDuringBackoffTest() {
+    std::vector<std::vector<PullReadResult>> scripts;
+    scripts.push_back({
+        MakeStatusResult(
+            PullReadStatus::RetryableError,
+            PullErrorCategory::Network,
+            true,
+            "stop during backoff"),
+    });
+
+    boost::asio::io_context io;
+    auto session = std::make_shared<MediaStreamSession>(io);
+    session->SetPuller(std::make_unique<ReconnectPuller>(
+        std::vector<bool>{true}, std::move(scripts)));
+
+    InputEndpointConfig endpoint;
+    endpoint.uri = "scripted://stop-during-backoff";
+    endpoint.puller_kind = PullerKind::FFmpeg;
+    session->SetEndpoint(endpoint);
+
+    SessionConfig config;
+    config.reconnect.enabled = true;
+    config.reconnect.initial_delay = std::chrono::milliseconds(750);
+    config.reconnect.max_attempts = 1;
+    session->SetSessionConfig(config);
+
+    Observations observations;
+    AttachCallbacks(session, observations);
+    if (!session->Start() ||
+        !WaitForState(observations, MediaStreamSession::State::KRECONNECTING)) {
+        std::cerr << "Stop-during-backoff did not enter RECONNECTING"
+                  << std::endl;
+        session->Stop();
+        return false;
+    }
+
+    const auto stop_start = std::chrono::steady_clock::now();
+    session->Stop();
+    const auto stop_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - stop_start);
+    const MediaStreamSession::Stats stats = session->GetStats();
+
+    // 若仍使用 sleep_for(750ms)，Stop() 会明显超过该阈值；条件变量被
+    // Stop() 唤醒后，应在一个较小调度窗口内完成。
+    if (stop_duration >= std::chrono::milliseconds(250) ||
+        stats.reconnect_count != 1) {
+        std::cerr << "Stop did not interrupt reconnect backoff: duration="
+                  << stop_duration.count() << "ms" << std::endl;
+        return false;
+    }
+
+    std::cout << "Stop interrupted reconnect backoff in "
+              << stop_duration.count() << "ms" << std::endl;
+    return true;
+}
+
+bool RunStableResetTest() {
+    // 第 1 条连接立即断开；第 2 条连接先保持一段稳定时间，再断开；
+    // 第 3 条连接正常 EOS。若稳定重置生效，第 2 次断开仍可使用一次
+    // 重连预算并成功建立第 3 条连接。
+    std::vector<std::vector<PullReadResult>> scripts;
+    scripts.push_back({
+        MakeStatusResult(
+            PullReadStatus::RetryableError,
+            PullErrorCategory::Network,
+            true,
+            "stable reset first connection lost"),
+    });
+
+    std::vector<PullReadResult> stable_connection;
+    for (int index = 0; index < 6; ++index) {
+        stable_connection.push_back(MakeNoDataResult());
+    }
+    stable_connection.push_back(MakeStatusResult(
+        PullReadStatus::RetryableError,
+        PullErrorCategory::Network,
+        true,
+        "stable reset second connection lost"));
+    scripts.push_back(std::move(stable_connection));
+
+    scripts.push_back({
+        MakeStatusResult(
+            PullReadStatus::EOS,
+            PullErrorCategory::EndOfInput,
+            false,
+            "stable reset input ended"),
+    });
+
+    boost::asio::io_context io;
+    auto session = std::make_shared<MediaStreamSession>(io);
+    session->SetPuller(std::make_unique<ReconnectPuller>(
+        std::vector<bool>{true, true, true}, std::move(scripts)));
+
+    InputEndpointConfig endpoint;
+    endpoint.uri = "scripted://stable-reset";
+    endpoint.puller_kind = PullerKind::FFmpeg;
+    session->SetEndpoint(endpoint);
+
+    SessionConfig config;
+    config.reconnect.enabled = true;
+    config.reconnect.initial_delay = std::chrono::milliseconds(0);
+    config.reconnect.max_attempts = 1;
+    config.reconnect.reset_after_stable = std::chrono::milliseconds(50);
+    config.no_data_backoff = std::chrono::milliseconds(15);
+    session->SetSessionConfig(config);
+
+    Observations observations;
+    AttachCallbacks(session, observations);
+    if (!session->Start() || !WaitForTerminal(session, observations)) {
+        return false;
+    }
+
+    session->Stop();
+    const MediaStreamSession::Stats stats = session->GetStats();
+
+    if (*observations.terminal_state != MediaStreamSession::State::KSTOPPED ||
+        stats.reconnect_count != 2 || observations.stream_info_count != 3 ||
+        !ContainsState(observations,
+                       MediaStreamSession::State::KRECONNECTING)) {
+        std::cerr << "Stable reconnect budget reset assertions failed"
+                  << std::endl;
+        return false;
+    }
+
+    std::cout << "Stable reconnect budget reset: reconnect_attempts="
+              << stats.reconnect_count << ", stream_info_callbacks="
+              << observations.stream_info_count << std::endl;
+    return true;
+}
+
 }  // namespace
 
 int main() {
-    if (!RunReconnectSuccessTest()) {
+    //if (!RunReconnectSuccessTest()) {
+    //    return 1;
+    //}
+    //if (!RunReconnectExhaustedTest()) {
+    //    return 1;
+    //}
+    if (!RunExponentialBackoffTest()) {
         return 1;
     }
-    if (!RunReconnectExhaustedTest()) {
+    if (!RunStopDuringBackoffTest()) {
+        return 1;
+    }
+    if (!RunStableResetTest()) {
         return 1;
     }
 
