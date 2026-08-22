@@ -159,7 +159,6 @@ PullOpenResult FFmpegPuller::Open(const InputEndpointConfig& endpoint) {
 
     if (config_.latency == LatencyMode::Low) {
         av_dict_set(&options, "fflags", "nobuffer", 0);
-        av_dict_set(&options, "flags", "low_delay", 0);
     }
 
     // RTSP 协议选项
@@ -193,13 +192,6 @@ PullOpenResult FFmpegPuller::Open(const InputEndpointConfig& endpoint) {
         input_format,
         &options);
 
-    // 检查是否有未被消耗的选项
-    for (AVDictionaryEntry* entry = nullptr;
-         (entry = av_dict_get(options, "", entry, AV_DICT_IGNORE_SUFFIX)) != nullptr;) {
-        LOG_WARN("FFmpeg option was not consumed: {}", entry->key);
-    }
-    av_dict_free(&options);
-
     if (open_result < 0) {
         const bool timed_out = interrupt_ctx_.timed_out.load();
         const auto result = OpenFailure(
@@ -207,9 +199,18 @@ PullOpenResult FFmpegPuller::Open(const InputEndpointConfig& endpoint) {
             open_result,
             "avformat_open_input failed: " + FfmpegErrorText(open_result),
             timed_out);
+        av_dict_free(&options);
         Close();
         return result;
     }
+
+    // 仅在打开成功后检查未被消费的选项。打开失败时，FFmpeg 可能尚未处理
+    // 任何输入选项，残留项不能说明配置错误。
+    for (AVDictionaryEntry* entry = nullptr;
+         (entry = av_dict_get(options, "", entry, AV_DICT_IGNORE_SUFFIX)) != nullptr;) {
+        LOG_WARN("FFmpeg option was not consumed: {}", entry->key);
+    }
+    av_dict_free(&options);
 
     interrupt_ctx_.timed_out.store(false); 
     if (config_.io.connect_timeout.count() > 0) {

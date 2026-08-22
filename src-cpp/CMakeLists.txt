@@ -56,9 +56,8 @@ file(GLOB FFMPEG_RUNTIME_DLLS CONFIGURE_DEPENDS
 # 收集公共库源文件；main.cpp 由下方主程序目标单独编译。
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS "src/*.cpp")
 list(FILTER SOURCES EXCLUDE REGEX ".*/main\\.cpp$")
-# Session/Source 当前仍处于骨架阶段，先不并入公共库，避免阻塞
-# FFmpegPuller 的独立测试；进入 stream 阶段时再恢复这些源文件。
-list(FILTER SOURCES EXCLUDE REGEX ".*/media/stream/.*\\.cpp$")
+# MediaStreamSource 仍处于骨架阶段，先只接入已经实现的 Session。
+list(FILTER SOURCES EXCLUDE REGEX ".*/media/stream/stream_source\\.cpp$")
 
 # 创建静态库
 add_library(common_lib STATIC ${SOURCES})

@@ -2,21 +2,23 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
+
 #include <boost/asio/io_context.hpp>
-#include <boost/asio/steady_timer.hpp>
-#include <boost/system/error_code.hpp>
 
 #include "media/media_packet.h"
-#include "media/stream/stream_info.h"
 #include "media/puller/i_puller.h"
-#include "media/stream/source_config.h"
 #include "media/stream/jitterbuffer/adaptive_jitter_buffer.h"
+#include "media/stream/source_config.h"
+#include "media/stream/stream_info.h"
 
-/// @brief 媒体流会话
+
+/// @brief 持有 puller 的媒体流会话
 ///
 /// 管理一次拉流连接的生命周期，职责包括：
 ///   - 连接 / 断开 / 自动重连
@@ -31,7 +33,6 @@
 /// 由外部线程池或 io_context::run() 驱动。方便配合线程池 / io_context 池统一管理。
 class MediaStreamSession : public std::enable_shared_from_this<MediaStreamSession> {
 public:
-    /// @brief 会话状态
     enum class State {
         KIDLE,         ///< 空闲，未启动
         KCONNECTING,   ///< 连接中
@@ -41,151 +42,72 @@ public:
         KERROR,        ///< 不可恢复错误
     };
 
-    /// @brief 统计快照
+    /// @brief 会话统计信息
     struct Stats {
         uint64_t bytes_received{0};   ///< 累计接收字节
         uint64_t packets_received{0}; ///< 累计接收包数
         double   bitrate{0.0};        ///< 当前码率（kbps）
-        uint32_t reconnect_count{0};  ///< 累计重连次数
+        uint32_t reconnect_count{0};  ///< 累计重连尝试次数
     };
 
-    /// @brief 构造
-    /// @param io 外部 io_context（用于异步定时器）
     explicit MediaStreamSession(boost::asio::io_context& io);
-
     ~MediaStreamSession();
 
-    // ==================== 生命周期 ====================
-
-    /// @brief 启动会话（打开拉流器 + 拉起读线程）
-    /// @return true 启动成功
     bool Start();
-
-    /// @brief 停止会话（关闭拉流器 + 等待读线程退出）
     void Stop();
 
-    // ==================== 配置 ====================
-
-    /// @brief 注入拉流器实例
     void SetPuller(std::unique_ptr<IPuller> puller);
+    void SetEndpoint(const InputEndpointConfig& endpoint);
+    void SetSessionConfig(const SessionConfig& config);
 
-    /// @brief 设置拉流 URL
+    // 对外接口，用于设置会话配置参数
+
+    /// @brief 设置会话 URL
     void SetUrl(const std::string& url);
-
     /// @brief 设置重连间隔（毫秒）
     void SetReconnectIntervalMs(int ms);
-
-    /// @brief 设置最大重连次数（-1 无限制）
+    /// @brief 设置最大重连次数
     void SetMaxReconnectCount(int count);
-
-    /// @brief 设置 jitter buffer 出队间隔（0 关闭，直接分发）
+    /// @brief 设置 Jitter Buffer 间隔（毫秒）
     void SetJitterBufferIntervalMs(int ms);
+    /// @brief 设置 Jitter Buffer 配置
     void SetJitterBufferConfig(const AdaptiveJitterBuffer::Config& config);
-    void ApplyPullerConfig(const MediaInputConfig& config);
-
-    /// @brief 设置 Watchdog 间隔（0 关闭）
+    /// @brief 设置 Watchdog 间隔（毫秒）
     void SetWatchdogIntervalMs(int ms);
 
-    // ==================== 回调 ====================
-
-    /// @brief 媒体包回调
     using PacketCallback = std::function<void(std::shared_ptr<MediaPacket>)>;
-
-    /// @brief 流信息回调
     using StreamInfoCallback = std::function<void(const MultiStreamInfo&)>;
-
-    /// @brief 会话状态变更回调
     using StateCallback = std::function<void(State)>;
 
     void SetPacketCallback(PacketCallback cb);
     void SetStreamInfoCallback(StreamInfoCallback cb);
     void SetStateCallback(StateCallback cb);
 
-    // ==================== 查询 ====================
-
-    /// @brief 获取当前状态
     State GetState() const;
-
-    /// @brief 获取统计快照
     Stats GetStats() const;
-
-    // ==================== 工具 ====================
-
-    /// @brief 转换状态为字符串（公开工具函数）
-    static const char* StateName(State s);
+    static const char* StateName(State state);
 
 private:
-    // ==================== 内部流程 ====================
-
-    /// @brief 打开拉流器（由 Start 或 Reconnect 调用）
-    void connect();
-
-    /// @brief 读循环（通过 io_context::post 调度）
     void readLoop();
+    bool tryReconnect(int& reconnect_attempts);
+    void notifyStreamInfo();
+    void setState(State state);
 
-    /// @brief 发起异步重连
-    void doReconnect();
+    boost::asio::io_context& io_;   ///< 异步 I/O 上下文，用于调度 ReadLoop
+    std::unique_ptr<IPuller> puller_; ///< 拉流器，负责从服务器拉取数据
+    InputEndpointConfig endpoint_;   ///< 输入端点配置，包含 URL、端口、用户名、密码等
+    SessionConfig session_config_;   ///< 会话配置，包含重连间隔、最大重连次数、Jitter Buffer 配置等
 
-    /// @brief 启动解码器驱动定时器
-    void startDecoderDriveTimer();
+    std::atomic<State> state_{State::KIDLE}; ///< 会话当前状态
+    std::atomic<bool> running_{false};  ///< 是否正在运行 ReadLoop
+    std::thread read_thread_; ///< 读线程，负责从 puller 读取数据
+    mutable std::mutex lifecycle_mutex_; ///< 生命周期互斥锁，用于保护 state_ 和 running_
 
-    /// @brief 解码器驱动定时器回调
-    void onDecoderDriveTimer(const boost::system::error_code& ec);
+    mutable std::mutex stats_mutex_; ///< 统计信息互斥锁，用于保护 stats_
+    Stats stats_;                    ///< 会话统计信息
 
-    /// @brief 入队媒体包
-    void enqueuePacket(std::shared_ptr<MediaPacket> packet);
-
-    /// @brief 分发媒体包
-    void dispatchPacket(std::shared_ptr<MediaPacket> packet);
-    
-    /// @brief 清空 jitter buffer
-    void clearJitterBuffer();
-
-    /// @brief 启动 Watchdog 定时器
-    void startWatchdog();
-
-    /// @brief Watchdog 检测回调
-    void onWatchdog(const boost::system::error_code& ec);
-
-    // ==================== 状态变更 ====================
-
-    /// @brief 安全切换状态并通知回调
-    void setState(State s);
-
-    // ==================== 成员 ====================
-
-    boost::asio::io_context& io_;        ///< 外部 io_context
-    std::unique_ptr<IPuller> puller_;    ///< 底层拉流器
-    std::string url_;                    ///< 拉流地址
-
-    std::atomic<State> state_{State::KIDLE}; ///< 当前状态
-    std::atomic<bool> running_{false};      ///< 读线程运行标志
-
-    boost::asio::steady_timer reconnect_timer_;      ///< 重连延迟定时器
-    boost::asio::steady_timer watchdog_timer_;       ///< Watchdog 定时器
-    boost::asio::steady_timer decoder_timer_;        ///< Decoder drive timer
-
-    // ── 配置 ──
-    int reconnect_interval_ms_{3000};   ///< 重连间隔
-    int max_reconnect_count_{-1};       ///< 最大重连次数
-    int watchdog_interval_ms_{0};       ///< Watchdog 间隔
-    int jitter_buffer_interval_ms_{0};  ///< Jitter buffer 分发间隔（0 关闭，直接分发）
-
-    // ── 重连状态 ──
-    int reconnect_count_{0};                            ///< 当前连续重连次数
-    std::chrono::steady_clock::time_point last_read_time_; ///< 上次成功读时间
-
-    // ── 统计 ──
-    std::atomic<uint64_t> async_bytes_received_{0};   ///< 周期内字节（原子）
-    std::atomic<uint64_t> async_packets_received_{0}; ///< 周期内包数（原子）
-    Stats stats_;                                      ///< 累积统计快照
-
-    // ── Jitter buffer ──
-    std::unique_ptr<AdaptiveJitterBuffer> jitter_buffer_;
-
-    // ── 回调 ──
-    std::mutex cb_mutex_;                ///< 保护回调 setter，防止启动后又修改了回调函数
-    PacketCallback     packet_cb_;       ///< 包分发回调
-    StreamInfoCallback streaminfo_cb_;   ///< 流信息回调
-    StateCallback      state_cb_;        ///< 状态变更回调
+    std::mutex cb_mutex_;            ///< 回调互斥锁，用于保护回调函数
+    PacketCallback packet_cb_;       ///< 数据包回调函数，用于处理从 puller 接收到的数据包
+    StreamInfoCallback streaminfo_cb_; ///< 流信息回调函数，用于处理从 puller 接收到的流信息
+    StateCallback state_cb_;         ///< 状态回调函数话状态变化
 };

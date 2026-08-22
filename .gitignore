@@ -25,6 +25,7 @@ dist-ssr
 
 # C++ Build directories
 src-cpp/build
+src-cpp/build-*
 src-cpp/out
 src-cpp/*.vcxproj
 src-cpp/*.vcxproj.filters
