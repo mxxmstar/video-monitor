@@ -3,12 +3,14 @@
 
 #include "media/puller/ffmpeg_puller.h"
 #include "media/decoder/ffmpeg_decoder.h"
-#include "media/converter/ffmpeg_audio_converter.h"
-#include "media/converter/ffmpeg_video_converter.h"
+#include "media/converter/media_frame_converter.h"
+#include "media/simple_buffer.h"
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <iostream>
 #include <utility>
+#include <vector>
 
 extern "C" {
 #include <libavutil/channel_layout.h>
@@ -176,7 +178,7 @@ int RunFfmpegPullerDecoderTest() {
         std::cout << "Decoded frame " << decoded_frames
                   << ": " << frame->Width() << "x" << frame->Height()
                   << ", pixel_format="
-                  << static_cast<int>(frame->GetPixelFormat())
+                  << static_cast<int>(frame->PixelFormat())
                   << ", pts_us=" << frame->time.pts_us
                   << std::endl;
     });
@@ -297,168 +299,160 @@ int RunFfmpegPullerDecoderTest() {
 }
 
 int RunFfmpegConverterTest() {
-    // 本测试不连接 RTSP，而是在内存中构造两种简单的 AVFrame，分别验证：
+    // 本测试不连接 RTSP，而是在内存中构造 MediaFrame，验证完整的公共链路：
     //
-    //   1. FFmpegVideoConverter 是否可以调用 sws_scale 完成视频转换；
-    //   2. FFmpegAudioConverter 是否可以调用 swr_convert 完成音频转换。
+    //   MediaFrame -> AVFrame -> sws/swr -> AVFrame -> MediaFrame
     //
-    // 使用合成帧的好处是输入尺寸、格式、采样率和样本数完全确定。这样
-    // 测试失败时，可以先排除网络、解码器和媒体流内容带来的干扰。
+    // 输入使用工程层的 MediaFrame，而不是直接把 AVFrame 交给底层转换器，
+    // 这样可以同时验证 MediaFrame 的元数据、平面信息和 buffer 是否能被
+    // 正确适配到 FFmpeg。
     std::cout << "Running FFmpeg converter test" << std::endl;
 
     // --------------------------- 视频转换测试 ---------------------------
-    // 构造一帧 4x4 的 YUV420P 视频。4x4 只是为了让测试数据简单：
-    // Y 平面是 4x4，U/V 平面各是 2x2。
-    AVFrame* video_input = av_frame_alloc();
-    if (!video_input) {
-        std::cerr << "Failed to allocate video input frame" << std::endl;
-        return 1;
-    }
+    // 构造一帧 4x4 的 I420。I420 的连续内存布局是：
+    //
+    //   [Y: 4x4 = 16 字节][U: 2x2 = 4 字节][V: 2x2 = 4 字节]
+    //
+    // 这里的 offset/stride/size 就是 MediaFrame -> AVFrame 适配所依赖的
+    // 关键信息。
+    auto video_input = std::make_shared<MediaFrame>();
+    video_input->type = MediaType::VIDEO;
+    video_input->time.pts_us = 123;
+    video_input->time.dts_us = 123;
+    video_input->time.duration_us = 40'000;
 
-    video_input->format = AV_PIX_FMT_YUV420P;
-    video_input->width = 4;
-    video_input->height = 4;
-    video_input->pts = 123;
-    int ret = av_frame_get_buffer(video_input, 0);
-    if (ret < 0) {
-        std::cerr << "Failed to allocate video input buffer" << std::endl;
-        av_frame_free(&video_input);
-        return 1;
-    }
+    VideoFrameMeta video_meta{};
+    video_meta.pixel_format = PixelFormat::kI420;
+    video_meta.width = 4;
+    video_meta.height = 4;
+    video_meta.plane_count = 3;
+    video_meta.plane_info[0] = PlaneInfo{0, 4, 16};
+    video_meta.plane_info[1] = PlaneInfo{16, 2, 4};
+    video_meta.plane_info[2] = PlaneInfo{20, 2, 4};
+    video_input->meta = video_meta;
 
-    // 给三个平面填充可识别的值。这里不验证具体颜色，只验证转换后有
-    // 合法输出；转换算法的具体数值属于 swscale 的实现细节。
-    for (int row = 0; row < video_input->height; ++row) {
-        for (int col = 0; col < video_input->width; ++col) {
-            video_input->data[0][row * video_input->linesize[0] + col] =
-                static_cast<uint8_t>(16 + row * video_input->width + col);
-        }
+    std::vector<uint8_t> video_data(24, 0);
+    for (int i = 0; i < 16; ++i) {
+        video_data[static_cast<size_t>(i)] =
+            static_cast<uint8_t>(16 + i);
     }
-    for (int row = 0; row < video_input->height / 2; ++row) {
-        for (int col = 0; col < video_input->width / 2; ++col) {
-            video_input->data[1][row * video_input->linesize[1] + col] = 90;
-            video_input->data[2][row * video_input->linesize[2] + col] = 160;
-        }
-    }
+    std::fill(video_data.begin() + 16, video_data.begin() + 20, 90);
+    std::fill(video_data.begin() + 20, video_data.end(), 160);
+    video_input->buffer = std::make_shared<SimpleBuffer>(std::move(video_data));
 
-    FFmpegVideoConverter video_converter;
-    if (!video_converter.Open(2, 2, AV_PIX_FMT_NV12, SWS_BILINEAR)) {
+    MediaFrameConverter video_converter;
+    MediaFrameConverterConfig video_config{};
+    video_config.video.width = 2;
+    video_config.video.height = 2;
+    video_config.video.pixel_format = PixelFormat::kNV12;
+    if (!video_converter.Open(video_config)) {
         std::cerr << "Failed to open video converter: "
                   << video_converter.LastError() << std::endl;
-        av_frame_free(&video_input);
         return 1;
     }
 
-    AVFrame* video_output = video_converter.Convert(video_input);
-    if (!video_output) {
+    std::shared_ptr<MediaFrame> video_output;
+    if (!video_converter.Convert(*video_input, video_output) ||
+        !video_output) {
         std::cerr << "Video conversion failed: "
                   << video_converter.LastError() << std::endl;
-        video_converter.Close();
-        av_frame_free(&video_input);
         return 1;
     }
 
-    // NV12 是两个平面：Y 平面和交错的 UV 平面。这里只检查转换接口
-    // 的输出契约，不把 swscale 的颜色计算结果写死在测试中。
+    const auto* converted_video_meta = video_output->VideoMeta();
     const bool video_ok =
-        video_output->width == 2 &&
-        video_output->height == 2 &&
-        video_output->format == AV_PIX_FMT_NV12 &&
-        video_output->data[0] != nullptr &&
-        video_output->data[1] != nullptr &&
-        video_output->pts == video_input->pts;
+        video_output->type == MediaType::VIDEO &&
+        converted_video_meta != nullptr &&
+        converted_video_meta->width == 2 &&
+        converted_video_meta->height == 2 &&
+        converted_video_meta->pixel_format == PixelFormat::kNV12 &&
+        converted_video_meta->plane_count == 2 &&
+        video_output->buffer != nullptr &&
+        video_output->buffer->Size() > 0 &&
+        video_output->backend.type == BackendHandle::NONE &&
+        video_output->time.pts_us == video_input->time.pts_us;
 
     if (!video_ok) {
         std::cerr << "Video conversion output is invalid" << std::endl;
-        av_frame_free(&video_output);
-        video_converter.Close();
-        av_frame_free(&video_input);
         return 1;
     }
 
-    std::cout << "Video conversion passed: YUV420P 4x4 -> NV12 2x2"
+    std::cout << "Video conversion passed: I420 4x4 -> NV12 2x2"
               << std::endl;
-    av_frame_free(&video_output);
-    video_converter.Close();
-    av_frame_free(&video_input);
 
     // --------------------------- 音频转换测试 ---------------------------
     // 构造 160 个 8000Hz 单声道 S16P 样本，约对应 20ms 音频。
     // S16P 的每个声道拥有独立平面；单声道时只有 extended_data[0]。
-    AVFrame* audio_input = av_frame_alloc();
-    if (!audio_input) {
-        std::cerr << "Failed to allocate audio input frame" << std::endl;
-        return 1;
-    }
+    auto audio_input = std::make_shared<MediaFrame>();
+    audio_input->type = MediaType::AUDIO;
+    audio_input->time.pts_us = 456;
+    audio_input->time.dts_us = 456;
+    audio_input->time.duration_us = 20'000;
 
-    audio_input->format = AV_SAMPLE_FMT_S16P;
-    audio_input->sample_rate = 8000;
-    audio_input->nb_samples = 160;
-    audio_input->pts = 456;
-    ret = av_channel_layout_from_mask(&audio_input->ch_layout,
-                                      AV_CH_LAYOUT_MONO);
-    if (ret < 0) {
-        std::cerr << "Failed to set audio input channel layout" << std::endl;
-        av_frame_free(&audio_input);
-        return 1;
-    }
-    ret = av_frame_get_buffer(audio_input, 0);
-    if (ret < 0) {
-        std::cerr << "Failed to allocate audio input buffer" << std::endl;
-        av_frame_free(&audio_input);
-        return 1;
-    }
+    AudioFrameMeta audio_meta{};
+    audio_meta.sample_format = SampleFormat::S16P;
+    audio_meta.sample_rate = 8000;
+    audio_meta.channels = 1;
+    audio_meta.channel_layout = AV_CH_LAYOUT_MONO;
+    audio_meta.nb_samples = 160;
+    audio_meta.bytes_per_sample = 2;
+    audio_meta.planar = true;
+    audio_meta.plane_count = 1;
+    audio_meta.planes[0] = PlaneInfo{0, 320, 320};
+    audio_input->meta = audio_meta;
 
-    auto* audio_samples = reinterpret_cast<int16_t*>(audio_input->data[0]);
-    for (int i = 0; i < audio_input->nb_samples; ++i) {
+    std::vector<uint8_t> audio_data(320, 0);
+    auto* audio_samples = reinterpret_cast<int16_t*>(audio_data.data());
+    for (int i = 0; i < 160; ++i) {
         // 使用递增波形即可，测试重点是格式转换链路，不是音频内容质量。
         audio_samples[i] = static_cast<int16_t>((i % 32) * 500);
     }
+    audio_input->buffer = std::make_shared<SimpleBuffer>(std::move(audio_data));
 
-    FFmpegAudioConverter audio_converter;
-    if (!audio_converter.Open(AV_CH_LAYOUT_STEREO,
-                              16000,
-                              AV_SAMPLE_FMT_S16)) {
+    MediaFrameConverter audio_converter;
+    MediaFrameConverterConfig audio_config{};
+    audio_config.audio.sample_rate = 16000;
+    audio_config.audio.channels = 2;
+    audio_config.audio.channel_layout = AV_CH_LAYOUT_STEREO;
+    audio_config.audio.sample_format = SampleFormat::S16;
+    if (!audio_converter.Open(audio_config)) {
         std::cerr << "Failed to open audio converter: "
                   << audio_converter.LastError() << std::endl;
-        av_frame_free(&audio_input);
         return 1;
     }
 
-    AVFrame* audio_output = audio_converter.Convert(audio_input);
-    if (!audio_output) {
+    std::shared_ptr<MediaFrame> audio_output;
+    if (!audio_converter.Convert(*audio_input, audio_output) ||
+        !audio_output) {
         std::cerr << "Audio conversion failed: "
                   << audio_converter.LastError() << std::endl;
-        audio_converter.Close();
-        av_frame_free(&audio_input);
         return 1;
     }
 
+    const auto* converted_audio_meta = audio_output->AudioMeta();
     // 8000Hz -> 16000Hz 后，样本数应大致翻倍；具体边界可能受 swr 延迟
     // 和重采样实现影响，所以这里只要求输出为正数，而不写死精确数量。
     const bool audio_ok =
-        audio_output->format == AV_SAMPLE_FMT_S16 &&
-        audio_output->sample_rate == 16000 &&
-        audio_output->ch_layout.nb_channels == 2 &&
-        audio_output->nb_samples > 0 &&
-        audio_output->data[0] != nullptr &&
-        audio_output->pts == audio_input->pts;
+        audio_output->type == MediaType::AUDIO &&
+        converted_audio_meta != nullptr &&
+        converted_audio_meta->sample_format == SampleFormat::S16 &&
+        converted_audio_meta->sample_rate == 16000 &&
+        converted_audio_meta->channels == 2 &&
+        converted_audio_meta->nb_samples > 0 &&
+        !converted_audio_meta->planar &&
+        audio_output->buffer != nullptr &&
+        audio_output->buffer->Size() > 0 &&
+        audio_output->backend.type == BackendHandle::NONE &&
+        audio_output->time.pts_us == audio_input->time.pts_us;
 
     if (!audio_ok) {
         std::cerr << "Audio conversion output is invalid" << std::endl;
-        av_frame_free(&audio_output);
-        audio_converter.Close();
-        av_frame_free(&audio_input);
         return 1;
     }
 
     std::cout << "Audio conversion passed: S16P 8000Hz mono -> "
-              << "S16 16000Hz stereo, " << audio_output->nb_samples
+              << "S16 16000Hz stereo, " << converted_audio_meta->nb_samples
               << " output sample(s)" << std::endl;
-
-    av_frame_free(&audio_output);
-    audio_converter.Close();
-    av_frame_free(&audio_input);
 
     std::cout << "FFmpeg converter test passed" << std::endl;
     return 0;

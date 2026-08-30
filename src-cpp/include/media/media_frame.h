@@ -80,7 +80,7 @@ public:
     FrameMeta meta;                                 ///< 媒体帧元数据            
 
     std::shared_ptr<IMediaBuffer> buffer;           ///< packed 图像数据
-    BackendHandle backend;                          ///< 后端引擎句柄
+    BackendHandle backend;                          ///< 所有权句柄
 
     /// @brief 获取视频元数据（若 type 为 VIDEO）
     const VideoFrameMeta* VideoMeta() const {
@@ -111,7 +111,7 @@ public:
     }
 
     /// @brief 获取像素格式
-    PixelFormat GetPixelFormat() const {
+    PixelFormat PixelFormat() const {
         if (auto* v = VideoMeta()) return v->pixel_format;
         return PixelFormat::kUnknown;
     }

@@ -34,10 +34,8 @@ enum class CodecType : int {
 /// 后端引擎句柄，用于传递特定引擎的内部对象指针
 struct BackendHandle {
     enum Type {
-        NONE = 0,     ///< 无后端
-        FFMPEG,       ///< FFmpeg AVPacket / AVFrame
-        OPENH264,     ///< OpenH264 编码器
-        WEBRTC,       ///< WebRTC 内部缓冲区
+        NONE = 0,     ///< 无后端，MediaFrame 持有所有权
+        FFMPEG       ///< FFmpeg AVPacket / AVFrame 持有所有权       
     };
     Type type{NONE};  ///< 后端类型
     void* ptr{nullptr};///< 后端内部对象指针
