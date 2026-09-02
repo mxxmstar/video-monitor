@@ -130,6 +130,8 @@ AVFrame* FFmpegVideoConverter::Convert(const AVFrame* input) {
     output->pkt_dts = input->pkt_dts;
     output->duration = input->duration;
     output->sample_aspect_ratio = input->sample_aspect_ratio;
+    // 重置编码器帧的提示信息,通知视频编码器由其自己决定当前帧的类型
+    output->pict_type = AV_PICTURE_TYPE_NONE;
     return output;
 }
 

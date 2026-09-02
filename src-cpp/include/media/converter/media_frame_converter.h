@@ -49,6 +49,7 @@ struct MediaFrameConverterConfig {
     AudioConvertConfig audio;
 };
 
+
 class MediaFrameConverter {
 public:
     // 构造函数放在 cpp 中定义。成员 unique_ptr 指向前置声明类型，
@@ -76,7 +77,29 @@ public:
     void Close();
     
     /// @brief 获取最近错误信息
-    const std::string& LastError() const;
+    static const std::string& LastError();
+
+    /// @brief 构建AVFrame
+    /// @param input 输入媒体帧
+    /// @param av_frame 输出AVFrame
+    /// @return 是否成功构建AVFrame
+    static bool MediaFrameToAVFrame(const MediaFrame& input, AVFrame* av_frame);
+    
+    /// @brief 构建媒体帧
+    /// @param av_frame 输入AVFrame
+    /// @param media_frame 输出媒体帧
+    /// @return 是否成功构建媒体帧
+    static bool AvFrameToMediaFrame(const AVFrame& av_frame, MediaFrame* media_frame);
+
+    /// @brief 设置 AVFrame 时间戳
+    /// @param input 输入 MediaFrame
+    /// @param output 输出 AVFrame
+    static void SetAVFrameTime(const MediaFrame& input, AVFrame* output);
+
+    /// @brief 设置 MediaFrame 时间戳
+    /// @param input 输入 AVFrame
+    /// @param output 输出 MediaFrame
+    static void SetMediaFrameTime(const AVFrame& input, MediaFrame* output);
 
 private:
     /// @brief FFmpeg视频转换，基于swscale
@@ -91,24 +114,12 @@ private:
     /// @param output 输出音频帧
     /// @return 是否成功转换
     bool ffmpegAudioConvert(const MediaFrame& input,
-                            std::shared_ptr<MediaFrame>& output);
-
-    /// @brief 构建AVFrame
-    /// @param input 输入媒体帧
-    /// @param av_frame 输出AVFrame
-    /// @return 是否成功构建AVFrame
-    bool mediaFrameToAVFrame(const MediaFrame& input, AVFrame* av_frame);
-    
-    /// @brief 构建媒体帧
-    /// @param av_frame 输入AVFrame
-    /// @param media_frame 输出媒体帧
-    /// @return 是否成功构建媒体帧
-    bool avFrameToMediaFrame(const AVFrame& av_frame, MediaFrame* media_frame);
+                            std::shared_ptr<MediaFrame>& output);    
 
     VideoConvertConfig video_config_{};
     AudioConvertConfig audio_config_{};
     ConvertBackend backend_{ConvertBackend::FFmpeg};
-    std::string last_error_{}; ///< 最近错误信息
+    inline static std::string last_error_; ///< 最近错误信息
 
     // MediaFrameConverter 负责输入输出适配；具体的 sws/swr 调用由这两个
     // 已有的 FFmpeg converter 完成。使用 unique_ptr 可以在头文件中隐藏

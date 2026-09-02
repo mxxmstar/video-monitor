@@ -48,6 +48,19 @@ struct MediaStreamInfo {
     template<typename T>
     const T& get_detail() const { return std::get<T>(detail); }
 
+    VideoStreamInfo Video() const {
+        if (media_type == MediaType::VIDEO) {
+            return std::get<VideoStreamInfo>(detail);
+        }
+        return VideoStreamInfo{};
+    }
+    AudioStreamInfo Audio() const {
+        if (media_type == MediaType::AUDIO) {
+            return std::get<AudioStreamInfo>(detail);
+        }
+        return AudioStreamInfo{};
+    }
+
     /// @brief 打印流信息到日志
     void Dump(bool dump_extra_data = true) const {
         LOG_INFO("StreamInfo: {}", media_type == MediaType::VIDEO ? "VIDEO" : "AUDIO");
@@ -55,10 +68,10 @@ struct MediaStreamInfo {
                  stream_index, static_cast<int>(codec_type), time_base.toString());
 
         if (media_type == MediaType::VIDEO) {
-            auto video_info = std::get<VideoStreamInfo>(detail);
+            auto video_info = Video();
             video_info.Dump();
         } else {
-            auto audio_info = std::get<AudioStreamInfo>(detail);
+            auto audio_info = Audio();
             audio_info.Dump();
         }
 

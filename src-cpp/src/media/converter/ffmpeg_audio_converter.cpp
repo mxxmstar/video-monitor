@@ -164,6 +164,24 @@ bool PrepareOutputLayout(AVFrame* output,
 
 #endif
 
+/// @brief 设置 AVFrame 的声道布局信息
+/// @param frame 目标 AVFrame 指针
+/// @param channels 声道数量（如 2 表示立体声）
+/// @param channel_layout 声道布局掩码（如 AV_CH_LAYOUT_STEREO）
+/// @note 如果 channel_layout 为 0，则根据 channels 自动生成默认布局
+void setFrameChannelLayout(AVFrame* frame, int channels, uint64_t channel_layout) {
+    if (!frame) {
+        return;
+    }
+
+    av_channel_layout_uninit(&frame->ch_layout);
+    if (channel_layout != 0) {
+        av_channel_layout_from_mask(&frame->ch_layout, channel_layout);
+    } else {
+        av_channel_layout_default(&frame->ch_layout, channels);
+    }
+}
+
 }  // namespace
 
 FFmpegAudioConverter::FFmpegAudioConverter() = default;

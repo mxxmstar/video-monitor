@@ -70,29 +70,7 @@ bool isBufferRangeValid(const MediaFrame& frame, int32_t offset, int32_t size) {
     return start <= frame.buffer->Size() && length <= frame.buffer->Size() - start;
 }
 
-/// @brief 设置 AVFrame 时间戳
-/// @param input 输入 MediaFrame
-/// @param output 输出 AVFrame
-void setAVFrameTime(const MediaFrame& input, AVFrame* output) {
-    // MediaFrame 的时间单位是微秒。转换器内部的 AVFrame 也暂时约定使用
-    // 微秒刻度；真正送入编码器时，编码器再按自己的 time_base 换算。
-    // kNoTimestamp 是工程层的“无时间戳”标记，不能直接写入 AVFrame，
-    // 必须转换为 FFmpeg 约定的 AV_NOPTS_VALUE。
-    output->pts = IsValidTimestamp(input.time.pts_us) ? input.time.pts_us : AV_NOPTS_VALUE;
-    output->pkt_dts = IsValidTimestamp(input.time.dts_us) ? input.time.dts_us : AV_NOPTS_VALUE;
-    output->duration = IsValidTimestamp(input.time.duration_us) ? input.time.duration_us : 0;
-}
 
-/// @brief 设置 MediaFrame 时间戳
-/// @param input 输入 AVFrame
-/// @param output 输出 MediaFrame
-void setAVFrameTime(const AVFrame& input, MediaFrame* output) {
-    // Converter 当前约定 AVFrame 中的时间戳也使用微秒刻度，因此这里不做
-    // time_base 换算。注意：kNoTimestamp 与 0 不同，0 是合法的首帧时间戳。
-    output->time.pts_us = input.pts == AV_NOPTS_VALUE ? kNoTimestamp : input.pts;
-    output->time.dts_us = input.pkt_dts == AV_NOPTS_VALUE ? kNoTimestamp : input.pkt_dts;
-    output->time.duration_us = input.duration == AV_NOPTS_VALUE ? kNoTimestamp : input.duration;
-}
 
 }  // namespace
 
@@ -204,7 +182,7 @@ bool MediaFrameConverter::ffmpegVideoConvert(const MediaFrame& input,
         return false;
     }
     // 转换为 AVFrame
-    if (!mediaFrameToAVFrame(input, source)) {
+    if (!MediaFrameToAVFrame(input, source)) {
         av_frame_free(&source);
         return false;
     }
@@ -219,7 +197,7 @@ bool MediaFrameConverter::ffmpegVideoConvert(const MediaFrame& input,
     // 创建 MediaFrame 并将转换后的 AVFrame 转换为 MediaFrame
     // 注意：MediaFrame.buffer 仍然负责保持原始 AVFrame 的生命周期，backend.ptr 只是指向该对象的非拥有指针。
     output = std::make_shared<MediaFrame>();
-    if (!avFrameToMediaFrame(*converted, output.get())) {
+    if (!AvFrameToMediaFrame(*converted, output.get())) {
         output.reset();
         av_frame_free(&converted);
         return false;
@@ -243,7 +221,7 @@ bool MediaFrameConverter::ffmpegAudioConvert(const MediaFrame& input,
         return false;
     }
 
-    if (!mediaFrameToAVFrame(input, source)) {
+    if (!MediaFrameToAVFrame(input, source)) {
         av_frame_free(&source);
         return false;
     }
@@ -256,7 +234,7 @@ bool MediaFrameConverter::ffmpegAudioConvert(const MediaFrame& input,
     }
 
     output = std::make_shared<MediaFrame>();
-    if (!avFrameToMediaFrame(*converted, output.get())) {
+    if (!AvFrameToMediaFrame(*converted, output.get())) {
         output.reset();
         av_frame_free(&converted);
         return false;
@@ -267,7 +245,7 @@ bool MediaFrameConverter::ffmpegAudioConvert(const MediaFrame& input,
     return true;
 }
 
-bool MediaFrameConverter::mediaFrameToAVFrame(const MediaFrame& input, AVFrame* av_frame) {
+bool MediaFrameConverter::MediaFrameToAVFrame(const MediaFrame& input, AVFrame* av_frame) {
     if (!av_frame) {
         last_error_ = "Output AVFrame is null";
         return false;
@@ -285,7 +263,7 @@ bool MediaFrameConverter::mediaFrameToAVFrame(const MediaFrame& input, AVFrame* 
             last_error_ = "av_frame_ref failed: " + AvErrorString(ret);
             return false;
         }
-        setAVFrameTime(input, av_frame);
+        SetAVFrameTime(input, av_frame);
         return true;
     }
 
@@ -349,7 +327,7 @@ bool MediaFrameConverter::mediaFrameToAVFrame(const MediaFrame& input, AVFrame* 
                       format,
                       meta->width,
                       meta->height);
-        setAVFrameTime(input, av_frame);
+        SetAVFrameTime(input, av_frame);
         return true;
     }
 
@@ -432,7 +410,7 @@ bool MediaFrameConverter::mediaFrameToAVFrame(const MediaFrame& input, AVFrame* 
                         required_size);
         }
 
-        setAVFrameTime(input, av_frame);
+        SetAVFrameTime(input, av_frame);
         return true;
     }
 
@@ -440,7 +418,7 @@ bool MediaFrameConverter::mediaFrameToAVFrame(const MediaFrame& input, AVFrame* 
     return false;
 }
 
-bool MediaFrameConverter::avFrameToMediaFrame(const AVFrame& av_frame, MediaFrame* media_frame) {
+bool MediaFrameConverter::AvFrameToMediaFrame(const AVFrame& av_frame, MediaFrame* media_frame) {
     if (!media_frame) {
         last_error_ = "Output MediaFrame is null";
         return false;
@@ -448,7 +426,7 @@ bool MediaFrameConverter::avFrameToMediaFrame(const AVFrame& av_frame, MediaFram
     // 后面是将avframe中的数据复制到 SimpleBuffer 中，所有权为 MediaFrame
     *media_frame = MediaFrame{};
     media_frame->backend = {};
-    setAVFrameTime(av_frame, media_frame);
+    SetMediaFrameTime(av_frame, media_frame);
 
     if (av_frame.width > 0 && av_frame.height > 0) {
         const auto format = static_cast<AVPixelFormat>(av_frame.format);
@@ -613,6 +591,25 @@ bool MediaFrameConverter::avFrameToMediaFrame(const AVFrame& av_frame, MediaFram
     return false;
 }
 
+void MediaFrameConverter::SetAVFrameTime(const MediaFrame& input, AVFrame* output) {
+    // MediaFrame 的时间单位是微秒。转换器内部的 AVFrame 也暂时约定使用
+    // 微秒刻度；真正送入编码器时，编码器再按自己的 time_base 换算。
+    // kNoTimestamp 是工程层的“无时间戳”标记，不能直接写入 AVFrame，
+    // 必须转换为 FFmpeg 约定的 AV_NOPTS_VALUE。
+    output->pts = IsValidTimestamp(input.time.pts_us) ? input.time.pts_us : AV_NOPTS_VALUE;
+    output->pkt_dts = IsValidTimestamp(input.time.dts_us) ? input.time.dts_us : AV_NOPTS_VALUE;
+    output->duration = IsValidTimestamp(input.time.duration_us) ? input.time.duration_us : 0;
+}
+
+
+void MediaFrameConverter::SetMediaFrameTime(const AVFrame& input, MediaFrame* output) {
+    // Converter 当前约定 AVFrame 中的时间戳也使用微秒刻度，因此这里不做
+    // time_base 换算。注意：kNoTimestamp 与 0 不同，0 是合法的首帧时间戳。
+    output->time.pts_us = input.pts == AV_NOPTS_VALUE ? kNoTimestamp : input.pts;
+    output->time.dts_us = input.pkt_dts == AV_NOPTS_VALUE ? kNoTimestamp : input.pkt_dts;
+    output->time.duration_us = input.duration == AV_NOPTS_VALUE ? kNoTimestamp : input.duration;
+}
+
 void MediaFrameConverter::Close() {
     if (ffmpeg_video_converter_) {
         ffmpeg_video_converter_->Close();
@@ -629,6 +626,6 @@ void MediaFrameConverter::Close() {
     last_error_.clear();
 }
 
-const std::string& MediaFrameConverter::LastError() const {
+const std::string& MediaFrameConverter::LastError() {
     return last_error_;
 }

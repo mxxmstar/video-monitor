@@ -26,15 +26,6 @@ public:
     bool Decode(std::shared_ptr<MediaPacket> packet) override;
     void SetFrameCallback(FrameCallback cb) override;
 
-    /// @brief AVCodecID -> CodecType 映射
-    static CodecType MapAVCodecID(AVCodecID id);
-
-    /// @brief AVPixelFormat -> PixelFormat 映射
-    static PixelFormat MapAVPixelFormat(AVPixelFormat fmt);
-
-    /// @brief AVSampleFormat -> SampleFormat 映射
-    static SampleFormat MapAVSampleFormat(AVSampleFormat fmt);
-
 private:
     /// @brief 接收所有已解码帧并回调
     bool receiveFrames();
