@@ -27,7 +27,7 @@ constexpr int kExpectedPacketCount = 10;
 constexpr int kExpectedFrameCount = 10;
 constexpr int kMaxReadAttempts = INT_MAX;
 
-constexpr int kMaxTestSeconds = 1000;
+constexpr int kMaxTestSeconds = 60;
 
 FFmpegPullerConfig testPullerConfig() {
     FFmpegPullerConfig config;
@@ -47,6 +47,11 @@ InputEndpointConfig testInputEndpoint() {
     endpoint.uri = kRtspUri;
     endpoint.puller_kind = PullerKind::FFmpeg;
     return endpoint;
+}
+
+int64_t Now() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 int RunFfmpegPullerTest() {
@@ -432,18 +437,18 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
     int64_t decode_calls = 0;
     int64_t decode_errors = 0;
     int64_t decode_total_us = 0;
-    uint16_t decode_min_us = UINT16_MAX;
-    uint16_t decode_max_us = 0;
-    uint16_t decode_avg_us = 0;
+    uint32_t decode_min_us = UINT32_MAX;
+    uint32_t decode_max_us = 0;
+    uint32_t decode_avg_us = 0;
 
 
     MediaFrameConverter converter;
     int64_t converted_frames = 0;
     int64_t convert_errors = 0;
     int64_t convert_total_us = 0;
-    uint16_t convert_min_us = UINT16_MAX;
-    uint16_t convert_max_us = 0;
-    uint16_t convert_avg_us = 0;
+    uint32_t convert_min_us = UINT32_MAX;
+    uint32_t convert_max_us = 0;
+    uint32_t convert_avg_us = 0;
 
     MediaFrameConverterConfig convert_config;
     convert_config.backend = ConvertBackend::FFmpeg;
@@ -475,16 +480,15 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
     int64_t encode_calls = 0;
     int64_t encode_errors = 0;
     int64_t encode_total_us = 0;
-    uint16_t encode_min_us = UINT16_MAX;
-    uint16_t encode_max_us = 0;
-    uint16_t encode_avg_us = 0;
+    uint32_t encode_min_us = UINT32_MAX;
+    uint32_t encode_max_us = 0;
+    uint32_t encode_avg_us = 0;
 
     decoder.SetFrameCallback([&](std::shared_ptr<MediaFrame> frame) {
         if (!frame || frame->type != MediaType::VIDEO) {
             return;
         }
-
-        ++decoded_frames;
+        
         LOG_INFO("Decoded frame {}: {}x{}, pixel_format={}, pts_us={}",
                   decoded_frames, frame->Width(), frame->Height(),
                   static_cast<int>(frame->PixelFormat()), frame->time.pts_us);
@@ -493,7 +497,7 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
             return;
         }
 
-        ++decoded_frames;
+        
         LOG_INFO("Decoded frame {}: {}x{}, pixel_format={}, pts_us={}",
                   decoded_frames, frame->Width(), frame->Height(),
                   static_cast<int>(frame->PixelFormat()), frame->time.pts_us);
@@ -505,23 +509,35 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
         }
 
         std::shared_ptr<MediaFrame> converted_frame;
+        auto before_convert_time = std::chrono::steady_clock::now();
         if (!converter.Convert(*frame, converted_frame)) {
             LOG_ERROR("Failed to convert frame {}: {}", decoded_frames, MediaFrameConverter::LastError());
             return;
         }
-
-        ++converted_frames;
+        auto after_convert_time = std::chrono::steady_clock::now();
+        auto convert_duration_us = std::chrono::duration_cast<std::chrono::microseconds>(after_convert_time - before_convert_time).count();
+        convert_total_us += convert_duration_us;
+        convert_min_us = std::min(convert_min_us, static_cast<uint32_t>(convert_duration_us));
+        convert_max_us = std::max(convert_max_us, static_cast<uint32_t>(convert_duration_us));
+        convert_avg_us = static_cast<uint32_t>(convert_total_us / ++converted_frames);                
+        
         LOG_INFO("Converted frame {}: {}x{}, pixel_format={}, pts_us={}",
                   converted_frames, converted_frame->Width(), converted_frame->Height(),
                   static_cast<int>(converted_frame->PixelFormat()), converted_frame->time.pts_us);
-        
+                
         std::vector<PacketPtr> packets;
+        auto before_encode_time = std::chrono::steady_clock::now();
         if (!encoder.Encode(converted_frame, packets)) {
             LOG_ERROR("Failed to encode frame {}", decoded_frames);
             return;
         }
-
-        ++encoded_frames;
+        auto after_encode_time = std::chrono::steady_clock::now();
+        auto encode_duration_us = std::chrono::duration_cast<std::chrono::microseconds>(after_encode_time - before_encode_time).count();
+        encode_total_us += encode_duration_us;
+        encode_min_us = std::min(encode_min_us, static_cast<uint32_t>(encode_duration_us));
+        encode_max_us = std::max(encode_max_us, static_cast<uint32_t>(encode_duration_us));
+        encode_avg_us = static_cast<uint32_t>(encode_total_us / ++encoded_frames);                
+        
         for (const auto& packet : packets) {
             ++encoded_packets;            
             LOG_INFO("Encoded packet {}: size={}, pts={}, keyframe={}", encoded_packets,
@@ -586,12 +602,19 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
         }
 
         ++packet_count;
+        auto decode_start_time = Now();
         if (!decoder.Decode(read_result.packet)) {
             LOG_ERROR("Video decode failed at video packet {}", packet_count);
             decoder.Close();
             puller.Close();
             return 1;
         }
+        auto decode_end_time = Now();
+        auto decode_duration_us = decode_end_time - decode_start_time;
+        decode_total_us += decode_duration_us;
+        decode_min_us = std::min(decode_min_us, static_cast<uint32_t>(decode_duration_us));
+        decode_max_us = std::max(decode_max_us, static_cast<uint32_t>(decode_duration_us));
+        decode_avg_us = static_cast<uint32_t>(decode_total_us / ++decoded_frames);
         
         LOG_INFO("Packet {}: type={}, codec={}, stream_index={}, size={}",
                  packet_count, static_cast<int>(read_result.packet->type),
@@ -633,7 +656,11 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
     // video_packet_count 是过程诊断数据，不能作为“10 帧必须来自 10 包”
     // 的断言依据。
     LOG_INFO("FFmpegPuller -> FFmpegDecoder -> MediaFrameConverter -> FFmpegEncoder test passed");
-    LOG_INFO("decoded_frames: {}, converted_frames: {}, encoded_frames: {}, encoded_packets: {}", decoded_frames, converted_frames, encoded_frames, encoded_packets);             
+    LOG_INFO("decoded_frames: {}, converted_frames: {}, encoded_frames: {}, encoded_packets: {}", decoded_frames, converted_frames, encoded_frames, encoded_packets);
+    LOG_INFO("=======================");
+    LOG_INFO("Decode stats: decode {} frames, min decode time: {} us, max decode time: {} us, avg decode time: {} us, total decode time: {} us", decoded_frames, decode_min_us, decode_max_us, decode_avg_us, decode_total_us);
+    LOG_INFO("Convert stats: convert {} frames, min convert time: {} us, max convert time: {} us, avg convert time: {} us, total convert time: {} us", converted_frames, convert_min_us, convert_max_us, convert_avg_us, convert_total_us);
+    LOG_INFO("Encode stats: encode {} frames, min encode time: {} us, max encode time: {} us, avg encode time: {} us, total encode time: {} us", encoded_frames, encode_min_us, encode_max_us, encode_avg_us, encode_total_us);
     // LOG_INFO("Diagnostic: " << video_packet_count
     //     << " video packet(s) consumed from " << input_packet_count
     //     << " input packet(s)");
