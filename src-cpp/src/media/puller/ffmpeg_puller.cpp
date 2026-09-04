@@ -7,12 +7,13 @@
 #include <utility>
 
 #include "common/log/logger.h"
+#include "media/ffmpeg_format.h"
 #include "media/ffmpeg_packet_buffer.h"
 
 extern "C" {
 #include <libavutil/error.h>
 }
-
+using namespace Media;
 namespace {
 
 bool IsRtspUri(const std::string& uri) {
@@ -246,7 +247,7 @@ PullOpenResult FFmpegPuller::Open(const InputEndpointConfig& endpoint) {
 
         MediaStreamInfo info;
         info.stream_index = stream_index;
-        info.codec_type = MapCodecID(codecpar->codec_id);
+        info.codec_type = FromAVCodecID(codecpar->codec_id);
         info.time_base = {stream->time_base.num, stream->time_base.den};
 
         if (codecpar->extradata && codecpar->extradata_size > 0) {
@@ -261,6 +262,8 @@ PullOpenResult FFmpegPuller::Open(const InputEndpointConfig& endpoint) {
             VideoStreamInfo video;
             video.width = codecpar->width;
             video.height = codecpar->height;
+            // 拉流阶段很可能拿到的是NONE，解码阶段会再次获取
+            video.pixel_format = FromAVPixelFormat(static_cast<AVPixelFormat>(codecpar->format));
             if (stream->avg_frame_rate.num > 0 && stream->avg_frame_rate.den > 0) {
                 video.fps = static_cast<float>(stream->avg_frame_rate.num) /
                             static_cast<float>(stream->avg_frame_rate.den);
@@ -276,6 +279,7 @@ PullOpenResult FFmpegPuller::Open(const InputEndpointConfig& endpoint) {
             audio.sample_rate = codecpar->sample_rate;
             audio.channels = codecpar->ch_layout.nb_channels;
             audio.channel_layout = codecpar->ch_layout.u.mask;
+            audio.sample_format = FromAVSampleFormat(static_cast<AVSampleFormat>(codecpar->format));
             info.detail = audio;
             discovered_info.audio_stream_idx_ = info_index;
         }
@@ -551,7 +555,7 @@ PullReadResult FFmpegPuller::ReadPacket() {
     media_packet->type = codecpar->codec_type == AVMEDIA_TYPE_VIDEO
         ? MediaType::VIDEO
         : MediaType::AUDIO;
-    media_packet->codec = MapCodecID(codecpar->codec_id);
+    media_packet->codec = FromAVCodecID(codecpar->codec_id);
     media_packet->stream_index = stream_index;
     media_packet->pts = owned_packet->pts == AV_NOPTS_VALUE
         ? kNoTimestamp
@@ -689,19 +693,5 @@ void FFmpegPuller::updateVideoStreamInfo(int stream_index, int width, int height
             video.height = height;
             return;
         }
-    }
-}
-
-CodecType FFmpegPuller::MapCodecID(AVCodecID id) {
-    switch (id) {
-        case AV_CODEC_ID_H264: return CodecType::H264;
-        case AV_CODEC_ID_HEVC: return CodecType::H265;
-        case AV_CODEC_ID_AAC: return CodecType::AAC;
-        case AV_CODEC_ID_OPUS: return CodecType::OPUS;
-        case AV_CODEC_ID_PCM_ALAW: return CodecType::G711A;
-        case AV_CODEC_ID_PCM_MULAW: return CodecType::G711U;
-        case AV_CODEC_ID_ADPCM_G726: return CodecType::G726;
-        case AV_CODEC_ID_MJPEG: return CodecType::JPEG;
-        default: return CodecType::UNKNOWN;
     }
 }

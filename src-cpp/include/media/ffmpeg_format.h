@@ -70,16 +70,6 @@ inline SampleFormat FromAVSampleFormat(AVSampleFormat format) {
     }
 }
 
-inline CodecType FromAVCodecID(AVCodecID id) {
-    switch (id) {
-        case AV_CODEC_ID_H264: return CodecType::H264;
-        case AV_CODEC_ID_HEVC: return CodecType::H265;
-        case AV_CODEC_ID_AAC:  return CodecType::AAC;
-        case AV_CODEC_ID_OPUS: return CodecType::OPUS;
-        default:               return CodecType::UNKNOWN;
-    }
-}
-
 
 inline AVCodecID ToAVCodecID(CodecType type) {
     switch (type) {
@@ -91,5 +81,18 @@ inline AVCodecID ToAVCodecID(CodecType type) {
     }
 }
 
+inline CodecType FromAVCodecID(AVCodecID id) {
+    switch (id) {
+        case AV_CODEC_ID_H264: return CodecType::H264;
+        case AV_CODEC_ID_HEVC: return CodecType::H265;
+        case AV_CODEC_ID_AAC: return CodecType::AAC;
+        case AV_CODEC_ID_OPUS: return CodecType::OPUS;
+        case AV_CODEC_ID_PCM_ALAW: return CodecType::G711A;
+        case AV_CODEC_ID_PCM_MULAW: return CodecType::G711U;
+        case AV_CODEC_ID_ADPCM_G726: return CodecType::G726;
+        case AV_CODEC_ID_MJPEG: return CodecType::JPEG;
+        default: return CodecType::UNKNOWN;
+    }
+}
 
 }

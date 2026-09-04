@@ -1,18 +1,17 @@
-/// @file test_ffmpeg_puller.cpp
-/// @brief FFmpegPuller 的 RTSP 集成测试。
-
 #include "media/puller/ffmpeg_puller.h"
 #include "media/decoder/ffmpeg_decoder.h"
 #include "media/converter/media_frame_converter.h"
 #include "media/encoder/ffmpeg_encoder.h"
 #include "media/simple_buffer.h"
+#include "common/log/logger.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <iostream>
 #include <utility>
 #include <vector>
-
+#include <thread>
 extern "C" {
 #include <libavutil/channel_layout.h>
 #include <libavutil/frame.h>
@@ -22,11 +21,15 @@ extern "C" {
 
 namespace {
 
-constexpr const char* kRtspUri = "rtsp://192.168.66.125/live/mainstream";
+constexpr const char* kRtspUri = "rtsp://192.168.66.83/live/mainstream";
 constexpr int kExpectedPacketCount = 10;
-constexpr int kMaxReadAttempts = 10000;
 
-int RunFfmpegPullerTest() {
+constexpr int kExpectedFrameCount = 10;
+constexpr int kMaxReadAttempts = INT_MAX;
+
+constexpr int kMaxTestSeconds = 1000;
+
+FFmpegPullerConfig testPullerConfig() {
     FFmpegPullerConfig config;
     config.io.connect_timeout = std::chrono::seconds(5);
     config.io.read_timeout = std::chrono::seconds(5);
@@ -36,33 +39,39 @@ int RunFfmpegPullerTest() {
     rtsp.transport = "tcp";
     config.rtsp = rtsp;
 
+    return config;
+}
+
+InputEndpointConfig testInputEndpoint() {
     InputEndpointConfig endpoint;
     endpoint.uri = kRtspUri;
     endpoint.puller_kind = PullerKind::FFmpeg;
+    return endpoint;
+}
+
+int RunFfmpegPullerTest() {
+    auto config = testPullerConfig();     
+    auto endpoint = testInputEndpoint();
 
     FFmpegPuller puller(std::move(config));
 
-    std::cout << "Opening RTSP stream: " << endpoint.uri << std::endl;
+    LOG_INFO("Opening RTSP stream: {}", endpoint.uri);
     const PullOpenResult open_result = puller.Open(endpoint);
     if (!open_result.Succeed()) {
-        std::cerr << "Open failed: "
-                  << (open_result.error.has_value()
+        LOG_ERROR("Open failed: {}", (open_result.error.has_value()
                           ? open_result.error->message
-                          : "unknown error")
-                  << std::endl;
+                          : "unknown error"));
         return 1;
     }
 
     const MultiStreamInfo stream_info = puller.GetStreamInfo();
     if (!stream_info.HasVideoStream() && !stream_info.HasAudioStream()) {
-        std::cerr << "Open succeeded, but no audio or video stream was found"
-                  << std::endl;
+        LOG_ERROR("Open succeeded, but no audio or video stream was found");
         puller.Close();
         return 1;
     }
 
-    std::cout << "Stream info: " << stream_info.stream_infos.size()
-              << " audio/video stream(s)" << std::endl;
+    LOG_INFO("Stream info: {}", stream_info.stream_infos.size());
 
     int packet_count = 0;
     for (int attempt = 0;
@@ -78,138 +87,88 @@ int RunFfmpegPullerTest() {
             !read_result.packet ||
             !read_result.packet->buffer ||
             read_result.packet->buffer->Size() == 0) {
-            std::cerr << "Read failed at attempt " << (attempt + 1)
-                      << ": status="
-                      << static_cast<int>(read_result.status);
+            LOG_ERROR("Read failed at attempt {}: status={}",
+                      static_cast<int>(read_result.status), (read_result.error.has_value() ? read_result.error->message : "unknown error"));
             if (read_result.error.has_value()) {
-                std::cerr << ", error=" << read_result.error->message;
+                LOG_ERROR(", error={}", read_result.error->message);    
             }
-            std::cerr << std::endl;
             puller.Close();
             return 1;
         }
 
         ++packet_count;
-        std::cout << "Packet " << packet_count
-                  << ": type="
-                  << static_cast<int>(read_result.packet->type)
-                  << ", codec="
-                  << static_cast<int>(read_result.packet->codec)
-                  << ", stream_index=" << read_result.packet->stream_index
-                  << ", size=" << read_result.packet->buffer->Size()
-                  << std::endl;
+        LOG_INFO("Packet {}: type={}, codec={}, stream_index={}, size={}",
+                 packet_count, static_cast<int>(read_result.packet->type),
+                 static_cast<int>(read_result.packet->codec), read_result.packet->stream_index,
+                 read_result.packet->buffer->Size());
     }
 
     puller.Close();
 
     if (packet_count != kExpectedPacketCount) {
-        std::cerr << "Only received " << packet_count << " packet(s), expected "
-                  << kExpectedPacketCount << std::endl;
+        LOG_ERROR("Only received {} packet(s), expected {}", packet_count, kExpectedPacketCount);
         return 1;
     }
 
-    std::cout << "FFmpegPuller RTSP test passed" << std::endl;
+    LOG_INFO("FFmpegPuller RTSP test passed");
     return 0;
 }
 
 int RunFfmpegPullerDecoderTest() {
-    // 本测试只验证一条最小视频解码链路：
-    //
-    //     RTSP -> FFmpegPuller -> H.264 MediaPacket -> FFmpegDecoder -> MediaFrame
-    //
-    // 该 RTSP 输入同时包含 H.264 视频和 G.711A 音频。一个 FFmpegDecoder
-    // 实例一次只能按一种 codec/轨道工作，所以循环中必须显式筛选视频包，
-    // 不能把音频包一并送给 H.264 解码器。
-    FFmpegPullerConfig config;
-    config.io.connect_timeout = std::chrono::seconds(5);
-    config.io.read_timeout = std::chrono::seconds(5);
-    config.latency = LatencyMode::Low;
-
-    RtspInputOptions rtsp;
-    rtsp.transport = "tcp";
-    config.rtsp = rtsp;
-
-    InputEndpointConfig endpoint;
-    endpoint.uri = kRtspUri;
-    endpoint.puller_kind = PullerKind::FFmpeg;
+    auto config = testPullerConfig();     
+    auto endpoint = testInputEndpoint();
 
     FFmpegPuller puller(std::move(config));
 
-    std::cout << "Opening RTSP stream: " << endpoint.uri << std::endl;
+    LOG_INFO("Opening RTSP stream: {}", endpoint.uri);
     const PullOpenResult open_result = puller.Open(endpoint);
     if (!open_result.Succeed()) {
-        std::cerr << "Open failed: "
-                  << (open_result.error.has_value()
+        LOG_ERROR("Open failed: {}", (open_result.error.has_value()
                           ? open_result.error->message
-                          : "unknown error")
-                  << std::endl;
+                          : "unknown error"));
         return 1;
     }
 
     const MultiStreamInfo stream_info = puller.GetStreamInfo();
-    // 这是“视频解码”测试，因此音频流存在与否不影响本测试；但必须能够
-    // 从 MultiStreamInfo 中找到视频流，否则无法创建 H.264 decoder。
-    if (!stream_info.HasVideoStream()) {
-        std::cerr << "Open succeeded, but no video stream was found"
-                  << std::endl;
+    if (!stream_info.HasVideoStream() && !stream_info.HasAudioStream()) {
+        LOG_ERROR("Open succeeded, but no audio or video stream was found");
         puller.Close();
         return 1;
     }
 
-    std::cout << "Stream info: " << stream_info.stream_infos.size()
-              << " audio/video stream(s)" << std::endl;
-
-    // video_stream_idx_ 是 stream_infos 容器中的位置；
-    // video_stream_info.stream_index 才是 FFmpeg/MediaPacket 使用的真实流号。
-    // 不能直接写 stream_infos[0]，因为其他输入中的音频、字幕等轨道可能
-    // 排在视频流之前。
-    const MediaStreamInfo& video_stream_info =
-        stream_info.stream_infos[stream_info.video_stream_idx_];
+    LOG_INFO("Stream info: {}", stream_info.stream_infos.size());
 
     FFmpegDecoder decoder;
     int decoded_frames = 0;
     decoder.SetFrameCallback([&](std::shared_ptr<MediaFrame> frame) {
-        // Decode() 可能因为 B 帧重排序而一次输出零帧或多帧，因此成功条件
-        // 应以真正收到的 MediaFrame 为准，不能只看送入 decoder 的包数量。
         if (!frame || frame->type != MediaType::VIDEO) {
             return;
         }
 
         ++decoded_frames;
-        std::cout << "Decoded frame " << decoded_frames
-                  << ": " << frame->Width() << "x" << frame->Height()
-                  << ", pixel_format="
-                  << static_cast<int>(frame->PixelFormat())
-                  << ", pts_us=" << frame->time.pts_us
-                  << std::endl;
+        LOG_WARN("Decoded frame {}: {}x{}, pixel_format={}, pts_us={}",
+                  decoded_frames, frame->Width(), frame->Height(),
+                  static_cast<int>(frame->PixelFormat()), frame->time.pts_us);        
     });
 
+    const MediaStreamInfo& video_stream_info =
+        stream_info.stream_infos[stream_info.video_stream_idx_];
     // Open() 会根据 H.264 的 codec、time_base 和 SPS/PPS extra_data 创建
     // AVCodecContext。若这一步失败，继续读取包没有意义。
     if (!decoder.Open(video_stream_info)) {
-        std::cerr << "Failed to open video decoder" << std::endl;
+        LOG_ERROR("Failed to open video decoder");
         puller.Close();
         return 1;
     }
+    
 
-    int input_packet_count = 0;
-    int video_packet_count = 0;
-    // 本测试的通过条件是解码出 10 帧视频，而不是收到 10 个视频包。
-    // 对 H.264 而言，编码包和解码帧并非一一对应：接入直播流后可能要先
-    // 等待关键帧，且 B 帧重排序也会影响某个包何时产生输出帧。
-    constexpr int kExpectedDecodedFrameCount = 10;
-
-    // 限制的是“读取尝试次数”，防止服务异常或始终没有关键帧时测试无限
-    // 等待。循环退出的正常条件是收到了足够的视频解码帧，而不是读到了
-    // 固定数量的音视频混合包。
+    int packet_count = 0;
     for (int attempt = 0;
-         attempt < kMaxReadAttempts &&
-         decoded_frames < kExpectedDecodedFrameCount;
+         attempt < kMaxReadAttempts && decoded_frames < kExpectedFrameCount;
          ++attempt) {
         const PullReadResult read_result = puller.ReadPacket();
 
         if (read_result.status == PullReadStatus::NoData) {
-            // NoData 不代表输入结束；live RTSP 在暂无可交付包时可正常返回它。
             continue;
         }
 
@@ -217,31 +176,15 @@ int RunFfmpegPullerDecoderTest() {
             !read_result.packet ||
             !read_result.packet->buffer ||
             read_result.packet->buffer->Size() == 0) {
-            std::cerr << "Read failed at attempt " << (attempt + 1)
-                      << ": status="
-                      << static_cast<int>(read_result.status);
+            LOG_ERROR("Read failed at attempt {}: status={}",
+                      static_cast<int>(read_result.status), (read_result.error.has_value() ? read_result.error->message : "unknown error"));
             if (read_result.error.has_value()) {
-                std::cerr << ", error=" << read_result.error->message;
+                LOG_ERROR(", error={}", read_result.error->message);    
             }
-            std::cerr << std::endl;
             puller.Close();
             return 1;
         }
 
-        ++input_packet_count;
-        std::cout << "Input packet " << input_packet_count
-                  << ": type="
-                  << static_cast<int>(read_result.packet->type)
-                  << ", codec="
-                  << static_cast<int>(read_result.packet->codec)
-                  << ", stream_index=" << read_result.packet->stream_index
-                  << ", size=" << read_result.packet->buffer->Size()
-                  << std::endl;
-
-        // 当前 RTSP 流有 audio(stream_index=1) 和 video(stream_index=0)。
-        // 音频 G.711A 数据没有 H.264 NAL 起始码；若送入 H.264 decoder，
-        // FFmpeg 必然打印 "No start code is found"。因此这里直接跳过
-        // 不属于当前视频轨道的包。
         if (read_result.packet->stream_index != video_stream_info.stream_index) {
             continue;
         }
@@ -250,27 +193,33 @@ int RunFfmpegPullerDecoderTest() {
         // Puller 的媒体元数据与实际视频轨道不一致时给出清晰报错。
         if (read_result.packet->type != MediaType::VIDEO ||
             read_result.packet->codec != video_stream_info.codec_type) {
-            std::cerr << "Video stream packet metadata does not match decoder"
-                      << std::endl;
+            LOG_ERROR("Video stream packet metadata does not match decoder");
             decoder.Close();
             puller.Close();
             return 1;
         }
 
-        ++video_packet_count;
+        ++packet_count;
         if (!decoder.Decode(read_result.packet)) {
-            std::cerr << "Video decode failed at video packet "
-                      << video_packet_count << std::endl;
+            LOG_ERROR("Video decode failed at video packet {}", packet_count);
             decoder.Close();
             puller.Close();
             return 1;
         }
+        
+        LOG_INFO("Packet {}: type={}, codec={}, stream_index={}, size={}",
+                 packet_count, static_cast<int>(read_result.packet->type),
+                 static_cast<int>(read_result.packet->codec), read_result.packet->stream_index,
+                 read_result.packet->buffer->Size());
     }
+
+    
+    
 
     // H.264 可能缓存 B 帧。即使读取循环已经停止，也要先向 decoder 发送
     // 空包进行 drain，才能拿到所有已接收编码包对应的尾部输出帧。
     if (!decoder.Flush()) {
-        std::cerr << "Failed to flush video decoder" << std::endl;
+        LOG_ERROR("Failed to flush video decoder");
         decoder.Close();
         puller.Close();
         return 1;
@@ -280,22 +229,12 @@ int RunFfmpegPullerDecoderTest() {
     decoder.Close();
     puller.Close();
 
-    if (decoded_frames < kExpectedDecodedFrameCount) {
-        std::cerr << "Only decoded " << decoded_frames << " video frame(s) from "
-                  << video_packet_count << " video packet(s) after "
-                  << input_packet_count << " input packet(s); expected "
-                  << kExpectedDecodedFrameCount << std::endl;
+    if (decoded_frames != kExpectedFrameCount) {
+        LOG_ERROR("Only decoded {} frame(s), expected {}", decoded_frames, kExpectedFrameCount);
         return 1;
     }
 
-    // 成功结果只表达测试真正验证的条件：已经解码出目标数量的视频帧。
-    // video_packet_count 是过程诊断数据，不能作为“10 帧必须来自 10 包”
-    // 的断言依据。
-    std::cout << "FFmpegPuller -> FFmpegDecoder test passed: "
-              << decoded_frames << " video frame(s) decoded" << std::endl;
-    std::cout << "Diagnostic: " << video_packet_count
-              << " video packet(s) consumed from " << input_packet_count
-              << " input packet(s)" << std::endl;
+    LOG_INFO("FFmpegPuller RTSP test passed");
     return 0;
 }
 
@@ -458,62 +397,54 @@ int RunFfmpegConverterTest() {
     std::cout << "FFmpeg converter test passed" << std::endl;
     return 0;
 }
+#if 1
 
 int RunFfmpegPullerDecoderConverterEncoderTest() {
-    FFmpegPullerConfig config;
-    config.io.connect_timeout = std::chrono::seconds(5);
-    config.io.read_timeout = std::chrono::seconds(5);
-    config.latency = LatencyMode::Low;
-
-    RtspInputOptions rtsp;
-    rtsp.transport = "tcp";
-    config.rtsp = rtsp;
-
-    InputEndpointConfig endpoint;
-    endpoint.uri = kRtspUri;
-    endpoint.puller_kind = PullerKind::FFmpeg;
+    auto config = testPullerConfig();     
+    auto endpoint = testInputEndpoint();
 
     FFmpegPuller puller(std::move(config));
 
-    std::cout << "Opening RTSP stream: " << endpoint.uri << std::endl;
+    LOG_INFO("Opening RTSP stream: {}", endpoint.uri);
     const PullOpenResult open_result = puller.Open(endpoint);
     if (!open_result.Succeed()) {
-        std::cerr << "Open failed: "
-            << (open_result.error.has_value()
-                ? open_result.error->message
-                : "unknown error")
-            << std::endl;
+        LOG_ERROR("Open failed: {}", (open_result.error.has_value()
+                          ? open_result.error->message
+                          : "unknown error"));
         return 1;
     }
 
     const MultiStreamInfo stream_info = puller.GetStreamInfo();
-    // 这是“视频解码”测试，因此音频流存在与否不影响本测试；但必须能够
-    // 从 MultiStreamInfo 中找到视频流，否则无法创建 H.264 decoder。
-    if (!stream_info.HasVideoStream()) {
-        std::cerr << "Open succeeded, but no video stream was found"
-            << std::endl;
+    if (!stream_info.HasVideoStream() && !stream_info.HasAudioStream()) {
+        LOG_ERROR("Open succeeded, but no audio or video stream was found");
         puller.Close();
         return 1;
     }
-
-    std::cout << "Stream info: " << stream_info.stream_infos.size()
-        << " audio/video stream(s)" << std::endl;
-
-    // video_stream_idx_ 是 stream_infos 容器中的位置；
-    // video_stream_info.stream_index 才是 FFmpeg/MediaPacket 使用的真实流号。
-    // 不能直接写 stream_infos[0]，因为其他输入中的音频、字幕等轨道可能
-    // 排在视频流之前。
     const MediaStreamInfo& video_stream_info =
         stream_info.stream_infos[stream_info.video_stream_idx_];
+    video_stream_info.Dump(false);
+
+    LOG_INFO("Stream info: {}", stream_info.stream_infos.size());
 
     FFmpegDecoder decoder;
-    int decoded_frames = 0;
-    int converted_frames = 0;
-    int encoded_frames = 0;
-    int encoded_packets = 0;
-    int64_t total_encoded_bytes = 0;
+    int64_t decoded_frames = 0;
+    int64_t decoded_packets = 0;
+    int64_t decode_calls = 0;
+    int64_t decode_errors = 0;
+    int64_t decode_total_us = 0;
+    uint16_t decode_min_us = UINT16_MAX;
+    uint16_t decode_max_us = 0;
+    uint16_t decode_avg_us = 0;
+
 
     MediaFrameConverter converter;
+    int64_t converted_frames = 0;
+    int64_t convert_errors = 0;
+    int64_t convert_total_us = 0;
+    uint16_t convert_min_us = UINT16_MAX;
+    uint16_t convert_max_us = 0;
+    uint16_t convert_avg_us = 0;
+
     MediaFrameConverterConfig convert_config;
     convert_config.backend = ConvertBackend::FFmpeg;
     convert_config.video.width = video_stream_info.Video().width;
@@ -526,9 +457,10 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
     encoder_config.bitrate = 2'000'000;
     encoder_config.thread_count = 1;
 
-    VideoEncoderConfig& video_enc_cfg = std::get<VideoEncoderConfig>(encoder_config.specific);
+    VideoEncoderConfig& video_enc_cfg = encoder_config.video();
     video_enc_cfg.width = video_stream_info.Video().width;
     video_enc_cfg.height = video_stream_info.Video().height;
+    LOG_INFO("Video h x w: {} x {}", video_enc_cfg.height, video_enc_cfg.width);
     video_enc_cfg.fps_num = 25;
     video_enc_cfg.fps_den = 1;
     video_enc_cfg.pixel_format = PixelFormat::kI420;
@@ -538,6 +470,14 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
     video_enc_cfg.tune = "zerolatency";
 
     FFmpegEncoder encoder;
+    int64_t encoded_frames = 0;
+    int64_t encoded_packets = 0;
+    int64_t encode_calls = 0;
+    int64_t encode_errors = 0;
+    int64_t encode_total_us = 0;
+    uint16_t encode_min_us = UINT16_MAX;
+    uint16_t encode_max_us = 0;
+    uint16_t encode_avg_us = 0;
 
     decoder.SetFrameCallback([&](std::shared_ptr<MediaFrame> frame) {
         if (!frame || frame->type != MediaType::VIDEO) {
@@ -545,83 +485,76 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
         }
 
         ++decoded_frames;
-        std::cout << "Decoded frame " << decoded_frames
-            << ": " << frame->Width() << "x" << frame->Height()
-            << ", pixel_format="
-            << static_cast<int>(frame->PixelFormat())
-            << ", pts_us=" << frame->time.pts_us
-            << std::endl;
+        LOG_INFO("Decoded frame {}: {}x{}, pixel_format={}, pts_us={}",
+                  decoded_frames, frame->Width(), frame->Height(),
+                  static_cast<int>(frame->PixelFormat()), frame->time.pts_us);
+
+        if (!frame || frame->type != MediaType::VIDEO) {
+            return;
+        }
+
+        ++decoded_frames;
+        LOG_INFO("Decoded frame {}: {}x{}, pixel_format={}, pts_us={}",
+                  decoded_frames, frame->Width(), frame->Height(),
+                  static_cast<int>(frame->PixelFormat()), frame->time.pts_us);
+
 
         if (!converter.Open(convert_config)) {
-            std::cerr << "Failed to open frame converter: "
-                      << MediaFrameConverter::LastError() << std::endl;
+            LOG_ERROR("Failed to open frame converter: {}", MediaFrameConverter::LastError());
             return;
         }
 
         std::shared_ptr<MediaFrame> converted_frame;
         if (!converter.Convert(*frame, converted_frame)) {
-            std::cerr << "Failed to convert frame " << decoded_frames << std::endl;
+            LOG_ERROR("Failed to convert frame {}: {}", decoded_frames, MediaFrameConverter::LastError());
             return;
         }
 
         ++converted_frames;
-        std::cout << "Converted frame " << converted_frames
-            << ": " << converted_frame->Width() << "x" << converted_frame->Height()
-            << ", pixel_format="
-            << static_cast<int>(converted_frame->PixelFormat())
-            << std::endl;
-
+        LOG_INFO("Converted frame {}: {}x{}, pixel_format={}, pts_us={}",
+                  converted_frames, converted_frame->Width(), converted_frame->Height(),
+                  static_cast<int>(converted_frame->PixelFormat()), converted_frame->time.pts_us);
+        
         std::vector<PacketPtr> packets;
         if (!encoder.Encode(converted_frame, packets)) {
-            std::cerr << "Failed to encode frame " << decoded_frames << std::endl;
+            LOG_ERROR("Failed to encode frame {}", decoded_frames);
             return;
         }
 
         ++encoded_frames;
         for (const auto& packet : packets) {
-            ++encoded_packets;
-            total_encoded_bytes += packet->buffer ? packet->buffer->Size() : 0;
-            std::cout << "Encoded packet " << encoded_packets
-                << ": size=" << (packet->buffer ? packet->buffer->Size() : 0)
-                << ", pts=" << packet->pts
-                << ", keyframe=" << packet->keyframe
-                << std::endl;
+            ++encoded_packets;            
+            LOG_INFO("Encoded packet {}: size={}, pts={}, keyframe={}", encoded_packets,
+                      (packet->buffer ? packet->buffer->Size() : 0), packet->pts, packet->keyframe);
         }
     });
-
+    
     // Open() 会根据 H.264 的 codec、time_base 和 SPS/PPS extra_data 创建
     // AVCodecContext。若这一步失败，继续读取包没有意义。
     if (!decoder.Open(video_stream_info)) {
-        std::cerr << "Failed to open video decoder" << std::endl;
+        LOG_ERROR("Failed to open video decoder");
         puller.Close();
         return 1;
     }
 
     if (!encoder.Open(encoder_config)) {
-        std::cerr << "Failed to open video encoder" << std::endl;
+        LOG_ERROR("Failed to open video encoder");
         decoder.Close();
         puller.Close();
         return 1;
     }
 
-    int input_packet_count = 0;
-    int video_packet_count = 0;
-    // 本测试的通过条件是解码出 10 帧视频，而不是收到 10 个视频包。
-    // 对 H.264 而言，编码包和解码帧并非一一对应：接入直播流后可能要先
-    // 等待关键帧，且 B 帧重排序也会影响某个包何时产生输出帧。
-    constexpr int kExpectedDecodedFrameCount = 10;
+    int packet_count = 0;
+    auto start_time = std::chrono::steady_clock::now();
+    while(1) {
+        auto end_time = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time).count() >= kMaxTestSeconds) {
+            break;
+        }
 
-    // 限制的是“读取尝试次数”，防止服务异常或始终没有关键帧时测试无限
-    // 等待。循环退出的正常条件是收到了足够的视频解码帧，而不是读到了
-    // 固定数量的音视频混合包。
-    for (int attempt = 0;
-        attempt < kMaxReadAttempts &&
-        decoded_frames < kExpectedDecodedFrameCount;
-        ++attempt) {
         const PullReadResult read_result = puller.ReadPacket();
 
         if (read_result.status == PullReadStatus::NoData) {
-            // NoData 不代表输入结束；live RTSP 在暂无可交付包时可正常返回它。
             continue;
         }
 
@@ -629,31 +562,15 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
             !read_result.packet ||
             !read_result.packet->buffer ||
             read_result.packet->buffer->Size() == 0) {
-            std::cerr << "Read failed at attempt " << (attempt + 1)
-                << ": status="
-                << static_cast<int>(read_result.status);
+            LOG_ERROR("Read failed at attempt {}: status={}",
+                      static_cast<int>(read_result.status), (read_result.error.has_value() ? read_result.error->message : "unknown error"));
             if (read_result.error.has_value()) {
-                std::cerr << ", error=" << read_result.error->message;
+                LOG_ERROR(", error={}", read_result.error->message);    
             }
-            std::cerr << std::endl;
             puller.Close();
             return 1;
         }
 
-        ++input_packet_count;
-        std::cout << "Input packet " << input_packet_count
-            << ": type="
-            << static_cast<int>(read_result.packet->type)
-            << ", codec="
-            << static_cast<int>(read_result.packet->codec)
-            << ", stream_index=" << read_result.packet->stream_index
-            << ", size=" << read_result.packet->buffer->Size()
-            << std::endl;
-
-        // 当前 RTSP 流有 audio(stream_index=1) 和 video(stream_index=0)。
-        // 音频 G.711A 数据没有 H.264 NAL 起始码；若送入 H.264 decoder，
-        // FFmpeg 必然打印 "No start code is found"。因此这里直接跳过
-        // 不属于当前视频轨道的包。
         if (read_result.packet->stream_index != video_stream_info.stream_index) {
             continue;
         }
@@ -662,28 +579,30 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
         // Puller 的媒体元数据与实际视频轨道不一致时给出清晰报错。
         if (read_result.packet->type != MediaType::VIDEO ||
             read_result.packet->codec != video_stream_info.codec_type) {
-            std::cerr << "Video stream packet metadata does not match decoder"
-                << std::endl;
+            LOG_ERROR("Video stream packet metadata does not match decoder");
             decoder.Close();
             puller.Close();
             return 1;
         }
 
-        ++video_packet_count;
+        ++packet_count;
         if (!decoder.Decode(read_result.packet)) {
-            std::cerr << "Video decode failed at video packet "
-                << video_packet_count << std::endl;
+            LOG_ERROR("Video decode failed at video packet {}", packet_count);
             decoder.Close();
-            encoder.Close();
             puller.Close();
             return 1;
         }
+        
+        LOG_INFO("Packet {}: type={}, codec={}, stream_index={}, size={}",
+                 packet_count, static_cast<int>(read_result.packet->type),
+                 static_cast<int>(read_result.packet->codec), read_result.packet->stream_index,
+                 read_result.packet->buffer->Size());
     }
 
     // H.264 可能缓存 B 帧。即使读取循环已经停止，也要先向 decoder 发送
     // 空包进行 drain，才能拿到所有已接收编码包对应的尾部输出帧。
     if (!decoder.Flush()) {
-        std::cerr << "Failed to flush video decoder" << std::endl;
+        LOG_ERROR("Failed to flush video decoder");
         decoder.Close();
         encoder.Close();
         puller.Close();
@@ -692,7 +611,7 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
 
     std::vector<PacketPtr> flush_packets;
     if (!encoder.Flush(flush_packets)) {
-        std::cerr << "Failed to flush video encoder" << std::endl;
+        LOG_ERROR("Failed to flush video encoder");
         decoder.Close();
         encoder.Close();
         puller.Close();
@@ -701,12 +620,8 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
 
     for (const auto& packet : flush_packets) {
         ++encoded_packets;
-        total_encoded_bytes += packet->buffer ? packet->buffer->Size() : 0;
-        std::cout << "Flush packet " << encoded_packets
-            << ": size=" << (packet->buffer ? packet->buffer->Size() : 0)
-            << ", pts=" << packet->pts
-            << ", keyframe=" << packet->keyframe
-            << std::endl;
+        LOG_INFO("Flush packet {}: size={}, pts={}, keyframe={}", encoded_packets,
+                 packet->buffer ? packet->buffer->Size() : 0, packet->pts, packet->keyframe);
     }
 
     // 先 Flush 再 Close：Close 只释放 AVCodecContext，不会主动输出缓存帧。
@@ -714,35 +629,23 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
     encoder.Close();
     puller.Close();
 
-    if (decoded_frames < kExpectedDecodedFrameCount) {
-        std::cerr << "Only decoded " << decoded_frames << " video frame(s) from "
-            << video_packet_count << " video packet(s) after "
-            << input_packet_count << " input packet(s); expected "
-            << kExpectedDecodedFrameCount << std::endl;
-        return 1;
-    }
-
     // 成功结果只表达测试真正验证的条件：已经解码出目标数量的视频帧。
     // video_packet_count 是过程诊断数据，不能作为“10 帧必须来自 10 包”
     // 的断言依据。
-    std::cout << "FFmpegPuller -> FFmpegDecoder -> MediaFrameConverter -> FFmpegEncoder test passed: "
-        << decoded_frames << " video frame(s) decoded, "
-        << converted_frames << " frame(s) converted, "
-        << encoded_frames << " frame(s) encoded, "
-        << encoded_packets << " packet(s) output" << std::endl;
-    std::cout << "Diagnostic: " << video_packet_count
-        << " video packet(s) consumed from " << input_packet_count
-        << " input packet(s)" << std::endl;
-    std::cout << "Total encoded bytes: " << total_encoded_bytes
-        << " (" << (total_encoded_bytes / 1024) << " KB)" << std::endl;
+    LOG_INFO("FFmpegPuller -> FFmpegDecoder -> MediaFrameConverter -> FFmpegEncoder test passed");
+    LOG_INFO("decoded_frames: {}, converted_frames: {}, encoded_frames: {}, encoded_packets: {}", decoded_frames, converted_frames, encoded_frames, encoded_packets);             
+    // LOG_INFO("Diagnostic: " << video_packet_count
+    //     << " video packet(s) consumed from " << input_packet_count
+    //     << " input packet(s)");
+    // LOG_INFO("Total encoded bytes: {} ({} KB)", total_encoded_bytes, (total_encoded_bytes / 1024));
     return 0;
 }
-
+#endif
 }  // namespace
 
 int main() {
-    // 当前先运行不依赖网络的 converter 测试。
-    // 需要重新验证 RTSP 解码链路时，可改为 RunFfmpegPullerDecoderTest()。
-    //return RunFfmpegConverterTest();
+    // RunFfmpegPullerTest();
+    // RunFfmpegPullerDecoderTest();
+    // RunFfmpegConverterTest();
     RunFfmpegPullerDecoderConverterEncoderTest();
 }

@@ -47,11 +47,6 @@ public:
     /// @brief 设置事件回调
     void SetEventCallback(EventCallback cb) override;
 
-    // ==================== 工具 ====================
-
-    /// @brief AVCodecID -> CodecType 映射
-    static CodecType MapCodecID(AVCodecID id);
-
 private:
     /// @brief FFmpeg 中断回调上下文
     struct InterruptContext {

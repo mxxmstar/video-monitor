@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <functional>
 
 #include "media/media_packet.h"
 #include "media/media_frame.h"
@@ -35,4 +36,15 @@ public:
     /// @brief 设置解码帧回调
     /// @param cb 每次解码出一帧时被调用
     virtual void SetFrameCallback(FrameCallback cb) = 0;
+};
+
+class DecoderStats {
+    uint64_t decoded_packet_count_{0}; ///< 已解码的包数量
+    uint64_t decoded_frame_count_{0}; ///< 已解码的帧数量
+    
+    uint64_t total_decode_time_us_{0}; ///< 总解码时间（微秒）
+    uint64_t max_decode_time_us_{0}; ///< 最大单帧解码时间（微秒）
+    uint64_t min_decode_time_us_{0}; ///< 最小单帧解码时间（微秒）
+
+    uint64_t avg_decode_time_us_{0}; ///< 平均单帧解码时间（微秒）    
 };

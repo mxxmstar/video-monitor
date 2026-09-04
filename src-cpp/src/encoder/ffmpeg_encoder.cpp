@@ -77,8 +77,7 @@ FFmpegEncoder::~FFmpegEncoder() {
 
 bool FFmpegEncoder::Open(const EncoderConfig& cfg) {
     Close();
-
-    // 参数校验    
+    // cfg.video().Dump();
     if (!cfg.is_valid()) {
         LOG_ERROR("Invalid encoder config");
         return false;

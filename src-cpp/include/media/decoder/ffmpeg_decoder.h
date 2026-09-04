@@ -1,12 +1,12 @@
 #pragma once
 
-#include "media/decoder/i_decoder.h"
-
-#include <mutex>
-
 extern "C" {
 #include <libavcodec/avcodec.h>
 }
+
+#include "media/decoder/i_decoder.h"
+
+#include <mutex>
 
 
 /// @brief FFmpeg 软件解码器

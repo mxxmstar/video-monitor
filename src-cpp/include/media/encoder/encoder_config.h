@@ -27,6 +27,7 @@ struct VideoEncoderConfig {
     std::string preset{"ultrafast"}; // 编码器 preset（支持 preset 参数的编码器使用）
     std::string tune{"zerolatency"}; // 编码器 tune 参数（如 zerolatency 通过禁用 B 帧、关闭参考帧缓存来降低延迟）
     int crf{-1};                     // CRF 质量控制值（< 0 表示不启用）
+    void Dump() const;
 };
 
 // 音频编码配置
@@ -35,6 +36,7 @@ struct AudioEncoderConfig {
     int channels{0};                 // 通道数
     uint64_t channel_layout{0};      // 通道布局
     SampleFormat sample_format{SampleFormat::S16P}; // 输入采样格式
+    void Dump() const;
 };
 
 // 编码器配置参数
@@ -59,8 +61,11 @@ struct EncoderConfig {
     bool is_video() const;
     bool is_audio() const;
 
-    AudioEncoderConfig audio() const;
-    VideoEncoderConfig video() const;
+    AudioEncoderConfig& audio();
+    VideoEncoderConfig& video();
+
+    const AudioEncoderConfig& audio() const;
+    const VideoEncoderConfig& video() const;
 };
 
 /// @brief 编码后的轨道信息
