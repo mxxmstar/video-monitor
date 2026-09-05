@@ -659,8 +659,9 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
     LOG_INFO("decoded_frames: {}, converted_frames: {}, encoded_frames: {}, encoded_packets: {}", decoded_frames, converted_frames, encoded_frames, encoded_packets);
     LOG_INFO("=======================");
     LOG_INFO("Decode stats: decode {} frames, min decode time: {} us, max decode time: {} us, avg decode time: {} us, total decode time: {} us", decoded_frames, decode_min_us, decode_max_us, decode_avg_us, decode_total_us);
-    LOG_INFO("Convert stats: convert {} frames, min convert time: {} us, max convert time: {} us, avg convert time: {} us, total convert time: {} us", converted_frames, convert_min_us, convert_max_us, convert_avg_us, convert_total_us);
-    LOG_INFO("Encode stats: encode {} frames, min encode time: {} us, max encode time: {} us, avg encode time: {} us, total encode time: {} us", encoded_frames, encode_min_us, encode_max_us, encode_avg_us, encode_total_us);
+    decoder.PrintStats();
+    // LOG_INFO("Convert stats: convert {} frames, min convert time: {} us, max convert time: {} us, avg convert time: {} us, total convert time: {} us", converted_frames, convert_min_us, convert_max_us, convert_avg_us, convert_total_us);
+    // LOG_INFO("Encode stats: encode {} frames, min encode time: {} us, max encode time: {} us, avg encode time: {} us, total encode time: {} us", encoded_frames, encode_min_us, encode_max_us, encode_avg_us, encode_total_us);
     // LOG_INFO("Diagnostic: " << video_packet_count
     //     << " video packet(s) consumed from " << input_packet_count
     //     << " input packet(s)");

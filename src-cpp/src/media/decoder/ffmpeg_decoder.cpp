@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstring>
 #include <limits>
+#include <chrono>
 
 extern "C" {
 #include <libavutil/avutil.h>
@@ -50,11 +51,28 @@ int64_t FramePts(const AVFrame* frame) {
     return frame->pts != AV_NOPTS_VALUE ? frame->pts : frame->best_effort_timestamp;
 }
 
+int64_t Now() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 } // namespace
+
+
+
+FFmpegDecoder::FFmpegDecoder() {
+#if DECODE_STATS_ENABLE
+    stats = DecoderStats{};
+#endif
+}
+
 
 
 FFmpegDecoder::~FFmpegDecoder() {
     Close();
+#if DECODE_STATS_ENABLE
+    ResetStats();
+#endif
 }
 
 bool FFmpegDecoder::Open(const MediaStreamInfo& info) {
@@ -179,10 +197,15 @@ bool FFmpegDecoder::Decode(std::shared_ptr<MediaPacket> packet) {
         return false;
     }
     if (!packet || !packet->buffer) {
+#if DECODE_STATS_ENABLE    
+        ++stats.decode_errors;
+#endif
         LOG_ERROR("FFmpegDecoder:Decode: invalid packet");
         return false;
     }
-
+#if DECODE_STATS_ENABLE    
+    ++stats.decode_calls;
+#endif
     // FFmpegPuller 输出的 packet 已经持有 AVPacket，可以直接复用。
     // AVTP/RTP 等输入通常只持有普通 IMediaBuffer，这里临时包装成 AVPacket。
     AVPacket* avpkt = nullptr;
@@ -190,6 +213,9 @@ bool FFmpegDecoder::Decode(std::shared_ptr<MediaPacket> packet) {
     if (packet->backend.type == BackendHandle::FFMPEG) {
         avpkt = static_cast<AVPacket*>(packet->backend.ptr);
         if (!avpkt) {
+#if DECODE_STATS_ENABLE    
+            ++stats.decode_errors;
+#endif
             LOG_ERROR("FFmpegDecoder:Decode: backend AVPacket is null");
             return false;
         }
@@ -206,6 +232,9 @@ bool FFmpegDecoder::Decode(std::shared_ptr<MediaPacket> packet) {
             temporary_packet = av_packet_alloc();
             if (!temporary_packet || av_packet_ref(temporary_packet, avpkt) < 0) {
                 av_packet_free(&temporary_packet);
+#if DECODE_STATS_ENABLE    
+                ++stats.decode_errors;
+#endif
                 LOG_ERROR("FFmpegDecoder:Decode: AVPacket timestamp copy failed");
                 return false;
             }
@@ -218,6 +247,9 @@ bool FFmpegDecoder::Decode(std::shared_ptr<MediaPacket> packet) {
         const std::size_t packet_size = packet->buffer->Size();
         if (!packet->buffer->Data() || packet_size == 0 ||
             packet_size > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+#if DECODE_STATS_ENABLE    
+            ++stats.decode_errors;
+#endif
             LOG_ERROR("FFmpegDecoder:Decode: invalid raw packet");
             return false;
         }
@@ -226,6 +258,9 @@ bool FFmpegDecoder::Decode(std::shared_ptr<MediaPacket> packet) {
         if (!temporary_packet ||
             av_new_packet(temporary_packet, static_cast<int>(packet_size)) < 0) {
             av_packet_free(&temporary_packet);
+#if DECODE_STATS_ENABLE    
+            ++stats.decode_errors;
+#endif
             LOG_ERROR("FFmpegDecoder:Decode: AVPacket allocation failed");
             return false;
         }
@@ -254,17 +289,40 @@ bool FFmpegDecoder::Decode(std::shared_ptr<MediaPacket> packet) {
         }
         avpkt = temporary_packet;
     }
-
+    
+#if DECODE_STATS_ENABLE
+    int64_t decode_start_time = Now();
+#endif
+    
     const int ret = avcodec_send_packet(codec_ctx_, avpkt);
     av_packet_free(&temporary_packet);
     if (ret < 0) {
+#if DECODE_STATS_ENABLE    
+        ++stats.decode_errors;
+#endif        
         char buf[AV_ERROR_MAX_STRING_SIZE];
         av_make_error_string(buf, AV_ERROR_MAX_STRING_SIZE, ret);
         LOG_ERROR("avcodec_send_packet failed: {}", buf);
         return false;
     }
+#if DECODE_STATS_ENABLE    
+    ++stats.decode_packets;
+#endif    
 
-    return receiveFrames();
+    bool receive_result = receiveFrames();
+    
+#if DECODE_STATS_ENABLE
+    int64_t decode_time_us = Now() - decode_start_time;
+    stats.total_decode_time_us += decode_time_us;
+    if (decode_time_us > stats.max_decode_time_us) {
+        stats.max_decode_time_us = decode_time_us;
+    }
+    if (decode_time_us < stats.min_decode_time_us) {
+        stats.min_decode_time_us = decode_time_us;
+    }
+#endif
+    
+    return receive_result;
 }
 
 void FFmpegDecoder::SetFrameCallback(FrameCallback cb) {
@@ -325,7 +383,9 @@ bool FFmpegDecoder::receiveFrames() {
             av_frame_free(&frame);
             return false;
         }
-
+#if DECODE_STATS_ENABLE    
+        ++stats.decode_frames;
+#endif        
         auto fb = std::make_shared<FFmpegFrameBuffer>(frame, static_cast<size_t>(size));
 
         // 上面已经将frame的所有权转移给了fb,这里需要重新分配新 frame
@@ -436,3 +496,18 @@ bool FFmpegDecoder::receiveFrames() {
     av_frame_free(&frame);
     return true;
 }
+
+#if DECODE_STATS_ENABLE    
+void FFmpegDecoder::PrintStats() const {
+    uint64_t avg_decode_time = stats.decode_frames > 0 
+        ? stats.total_decode_time_us / stats.decode_frames 
+        : 0;
+        
+    LOG_INFO("FFmpegDecoderStats: decode_calls: {}, decode_packets: {}, decode_frames: {}, decode_errors: {}", 
+             stats.decode_calls, stats.decode_packets, stats.decode_frames, stats.decode_errors);
+    LOG_INFO("FFmpegDecoderStats: total_decode_time(s): {}", stats.total_decode_time_us / 1000000.0);
+    LOG_INFO("FFmpegDecoderStats: max_decode_time(ms): {}", stats.max_decode_time_us / 1000.0);
+    LOG_INFO("FFmpegDecoderStats: min_decode_time(ms): {}", stats.min_decode_time_us / 1000.0);
+    LOG_INFO("FFmpegDecoderStats: avg_decode_time(ms): {}", avg_decode_time / 1000.0);
+}
+#endif

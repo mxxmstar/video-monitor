@@ -7,11 +7,25 @@
 #include "media/media_frame.h"
 #include "media/stream/stream_info.h"
 
-
+#define DECODE_STATS_ENABLE 1
 class IDecoder {
 public:
     using FrameCallback = std::function<void(std::shared_ptr<MediaFrame>)>;
+#if DECODE_STATS_ENABLE    
+    /// @brief 解码器统计信息
+    struct DecoderStats {            
+        uint64_t decode_packets{0}; ///< 已解码的包数量
+        uint64_t decode_frames{0}; ///< 已解码的帧数量
+        uint64_t decode_calls{0}; ///< 解码调用数量
+        uint64_t decode_errors{0}; ///< 解码错误调用数量
+        
+        uint64_t total_decode_time_us{0}; ///< 总解码时间（微秒）
+        uint64_t max_decode_time_us{0}; ///< 最大单帧解码时间（微秒）
+        uint64_t min_decode_time_us{UINT32_MAX}; ///< 最小单帧解码时间（微秒）
 
+        uint64_t avg_decode_time_us{0}; ///< 平均单帧解码时间（微秒）    
+    };
+#endif
     virtual ~IDecoder() = default;
 
     /// @brief 初始化解码器
@@ -36,15 +50,17 @@ public:
     /// @brief 设置解码帧回调
     /// @param cb 每次解码出一帧时被调用
     virtual void SetFrameCallback(FrameCallback cb) = 0;
+
+#if DECODE_STATS_ENABLE    
+    /// @brief 获取解码器统计信息
+    virtual const DecoderStats& GetStats() const {
+        return stats;
+    }
+    /// @brief 重置解码器统计信息
+    virtual void ResetStats() {
+        stats = DecoderStats{};
+    }
+    DecoderStats stats;
+#endif
 };
 
-class DecoderStats {
-    uint64_t decoded_packet_count_{0}; ///< 已解码的包数量
-    uint64_t decoded_frame_count_{0}; ///< 已解码的帧数量
-    
-    uint64_t total_decode_time_us_{0}; ///< 总解码时间（微秒）
-    uint64_t max_decode_time_us_{0}; ///< 最大单帧解码时间（微秒）
-    uint64_t min_decode_time_us_{0}; ///< 最小单帧解码时间（微秒）
-
-    uint64_t avg_decode_time_us_{0}; ///< 平均单帧解码时间（微秒）    
-};
