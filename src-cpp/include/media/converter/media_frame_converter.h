@@ -6,6 +6,8 @@
 
 #include "media/media_frame.h"
 
+#define CONVERT_STATS_ENABLE 1
+
 struct AVFrame;
 class FFmpegAudioConverter;
 class FFmpegVideoConverter;
@@ -52,6 +54,19 @@ struct MediaFrameConverterConfig {
 
 class MediaFrameConverter {
 public:
+#if CONVERT_STATS_ENABLE
+    /// @brief 转换器统计信息
+    struct ConvertStats {            
+        uint64_t convert_calls{0}; ///< 转换调用数量
+        uint64_t convert_frames{0}; ///< 已转换的帧数量
+        uint64_t convert_errors{0}; ///< 转换错误数量
+        
+        uint64_t total_convert_time_us{0}; ///< 总转换时间（微秒）
+        uint64_t max_convert_time_us{0}; ///< 最大单帧转换时间（微秒）
+        uint64_t min_convert_time_us{UINT64_MAX}; ///< 最小单帧转换时间（微秒）
+    };
+#endif
+
     // 构造函数放在 cpp 中定义。成员 unique_ptr 指向前置声明类型，
     // 只有在 cpp 已包含完整类型定义后，编译器才能正确生成销毁逻辑。
     MediaFrameConverter();
@@ -78,6 +93,18 @@ public:
     
     /// @brief 获取最近错误信息
     static const std::string& LastError();
+
+#if CONVERT_STATS_ENABLE
+    /// @brief 获取转换器统计信息
+    const ConvertStats& GetStats() const {
+        return stats;
+    }
+    /// @brief 重置转换器统计信息
+    void ResetStats() {
+        stats = ConvertStats{};
+    }
+    void PrintStats();
+#endif
 
     /// @brief 构建AVFrame
     /// @param input 输入媒体帧
@@ -128,4 +155,7 @@ private:
     std::unique_ptr<FFmpegAudioConverter> ffmpeg_audio_converter_{};
     bool opened_{false};
 
+#if CONVERT_STATS_ENABLE
+    ConvertStats stats{};
+#endif
 };

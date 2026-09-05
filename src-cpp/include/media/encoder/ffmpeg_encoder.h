@@ -26,7 +26,10 @@ public:
     EncodedTrackInfo GetOutputInfo() const override;
     /// @brief 关闭编码器，释放资源
     void Close() override;
-
+#if ENCODE_STATS_ENABLE
+    /// @brief 打印编码器统计信息
+    void PrintStats() const;
+#endif
 private:
     /// @brief 编码视频帧
     /// @param frame 输入视频帧

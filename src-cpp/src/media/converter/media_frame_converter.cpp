@@ -5,6 +5,7 @@
 #include "media/simple_buffer.h"
 #include "media/ffmpeg_format.h"
 
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <utility>
@@ -28,6 +29,11 @@ std::string AvErrorString(int error_code) {
     char buffer[AV_ERROR_MAX_STRING_SIZE]{};
     av_make_error_string(buffer, sizeof(buffer), error_code);
     return buffer;
+}
+
+int64_t Now() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 /// @brief 根据声道数量生成默认布局掩码
@@ -155,18 +161,47 @@ bool MediaFrameConverter::Convert(const MediaFrame& input, std::shared_ptr<Media
 
     if (!opened_) {
         last_error_ = "MediaFrameConverter is not opened";
+#if CONVERT_STATS_ENABLE
+        ++stats.convert_errors;
+#endif
         return false;
     }
 
+#if CONVERT_STATS_ENABLE
+    int64_t convert_start_time = Now();
+    ++stats.convert_calls;
+#endif
+
+    bool result = false;
     if (input.type == MediaType::VIDEO) {
-        return ffmpegVideoConvert(input, output);
-    }
-    if (input.type == MediaType::AUDIO) {
-        return ffmpegAudioConvert(input, output);
+        result = ffmpegVideoConvert(input, output);
+    } else if (input.type == MediaType::AUDIO) {
+        result = ffmpegAudioConvert(input, output);
+    } else {
+        last_error_ = "Unsupported MediaFrame type";
+#if CONVERT_STATS_ENABLE
+        ++stats.convert_errors;
+#endif
+        return false;
     }
 
-    last_error_ = "Unsupported MediaFrame type";
-    return false;
+#if CONVERT_STATS_ENABLE
+    if (result) {
+        ++stats.convert_frames;
+        int64_t convert_time_us = Now() - convert_start_time;
+        stats.total_convert_time_us += convert_time_us;
+        if (convert_time_us > stats.max_convert_time_us) {
+            stats.max_convert_time_us = convert_time_us;
+        }
+        if (convert_time_us < stats.min_convert_time_us) {
+            stats.min_convert_time_us = convert_time_us;
+        }
+    } else {
+        ++stats.convert_errors;
+    }
+#endif
+
+    return result;
 }
 
 bool MediaFrameConverter::ffmpegVideoConvert(const MediaFrame& input,
@@ -624,8 +659,25 @@ void MediaFrameConverter::Close() {
     audio_config_ = {};
     backend_ = ConvertBackend::FFmpeg;
     last_error_.clear();
+#if CONVERT_STATS_ENABLE
+    stats = ConvertStats{};
+#endif
 }
 
 const std::string& MediaFrameConverter::LastError() {
     return last_error_;
 }
+
+#if CONVERT_STATS_ENABLE
+void MediaFrameConverter::PrintStats() {
+    uint64_t avg_convert_time = stats.convert_frames > 0 
+        ? stats.total_convert_time_us / stats.convert_frames : 0;
+        
+    LOG_INFO("FFmpegConverterStats: convert_calls: {}, convert_frames: {}, convert_errors: {}", 
+             stats.convert_calls, stats.convert_frames, stats.convert_errors);
+    LOG_INFO("FFmpegConverterStats: total_convert_time(s): {}", stats.total_convert_time_us / 1000000.0);
+    LOG_INFO("FFmpegConverterStats: max_convert_time(ms): {}", stats.max_convert_time_us / 1000.0);
+    LOG_INFO("FFmpegConverterStats: min_convert_time(ms): {}", stats.min_convert_time_us / 1000.0);
+    LOG_INFO("FFmpegConverterStats: avg_convert_time(ms): {}", avg_convert_time / 1000.0);
+}
+#endif

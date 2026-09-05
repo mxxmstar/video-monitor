@@ -67,11 +67,20 @@ bool pickFirstSupportedSampleFormat(const AVCodec* codec, AVSampleFormat& fmt) {
 
     return false;
 }
+
+int64_t Now() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 }
 
 
 FFmpegEncoder::~FFmpegEncoder() {
     Close();
+#if ENCODE_STATS_ENABLE    
+    ResetStats();
+#endif    
 }
 
 
@@ -242,6 +251,10 @@ bool FFmpegEncoder::Encode(FramePtr frame, std::vector<PacketPtr>& packets) {
         return false;
     }
 
+#if ENCODE_STATS_ENABLE
+    ++stats.encode_calls;
+#endif
+
     if (config_.media_type == MediaType::VIDEO) {
         return encodeVideoFrame(frame, packets);
     } else {
@@ -296,14 +309,32 @@ void FFmpegEncoder::Close() {
 }
 
 bool FFmpegEncoder::encodeVideoFrame(FramePtr frame, std::vector<PacketPtr>& packets) {    
+#if ENCODE_STATS_ENABLE
+    int64_t encode_start_time = Now();
+#endif
+
     // flush: 发送 nullptr 触发 flush 操作
     if (frame == nullptr) {
         const int ret = avcodec_send_frame(codec_ctx_, nullptr);
         if (ret < 0 && ret != AVERROR_EOF) {
+#if ENCODE_STATS_ENABLE
+            ++stats.encode_errors;
+#endif
             LOG_WARN("FFmpegEncoder:EncodeVideoFrame: avcodec_send_frame failed: {}", AvErrorString(ret));
             return false;
         }
-        return receivePackets(packets);
+        bool result = receivePackets(packets);
+#if ENCODE_STATS_ENABLE
+        int64_t encode_time_us = Now() - encode_start_time;
+        stats.total_encode_time_us += encode_time_us;
+        if (encode_time_us > stats.max_encode_time_us) {
+            stats.max_encode_time_us = encode_time_us;
+        }
+        if (encode_time_us < stats.min_encode_time_us) {
+            stats.min_encode_time_us = encode_time_us;
+        }
+#endif
+        return result;
     }
 
     const int frame_width = frame->Width() > 0 ? frame->Width() : config_.video().width;
@@ -344,11 +375,31 @@ bool FFmpegEncoder::encodeVideoFrame(FramePtr frame, std::vector<PacketPtr>& pac
     av_frame_free(&input);
 
     if (ret < 0) {        
+#if ENCODE_STATS_ENABLE
+        ++stats.encode_errors;
+#endif
         LOG_WARN("avcodec_send_frame failed: {}", AvErrorString(ret));
         return false;
     }
 
-    return receivePackets(packets);
+#if ENCODE_STATS_ENABLE
+    ++stats.encode_frames;
+#endif
+
+    bool result = receivePackets(packets);
+    
+#if ENCODE_STATS_ENABLE
+    int64_t encode_time_us = Now() - encode_start_time;
+    stats.total_encode_time_us += encode_time_us;
+    if (encode_time_us > stats.max_encode_time_us) {
+        stats.max_encode_time_us = encode_time_us;
+    }
+    if (encode_time_us < stats.min_encode_time_us) {
+        stats.min_encode_time_us = encode_time_us;
+    }
+#endif
+    
+    return result;
 }
 
 bool FFmpegEncoder::encodeAudioFrame(FramePtr frame, std::vector<PacketPtr>& packets) {
@@ -440,6 +491,10 @@ bool FFmpegEncoder::receivePackets(std::vector<PacketPtr>& packets) {
         media_packet->buffer = pkt_buffer;
         media_packet->backend.type = BackendHandle::FFMPEG;
         media_packet->backend.ptr = pkt_buffer->GetPacket();
+
+#if ENCODE_STATS_ENABLE
+        ++stats.encode_packets;
+#endif
 
         packets.emplace_back(std::move(media_packet));
     }
@@ -640,4 +695,19 @@ int64_t FFmpegEncoder::resolveFramePts(const MediaFrame& frame) {
     // 未指定 pts，递增分配
     return next_pts_++;
 }
+
+#if ENCODE_STATS_ENABLE    
+void FFmpegEncoder::PrintStats() const {
+    uint64_t avg_encode_time = stats.encode_frames > 0 
+        ? stats.total_encode_time_us / stats.encode_frames : 0;
+        
+    LOG_INFO("FFmpegEncoderStats: encode_calls: {}, encode_packets: {}, encode_frames: {}, encode_errors: {}", 
+             stats.encode_calls, stats.encode_packets, stats.encode_frames, stats.encode_errors);
+    LOG_INFO("FFmpegEncoderStats: total_encode_time(s): {}", stats.total_encode_time_us / 1000000.0);
+    LOG_INFO("FFmpegEncoderStats: max_encode_time(ms): {}", stats.max_encode_time_us / 1000.0);
+    LOG_INFO("FFmpegEncoderStats: min_encode_time(ms): {}", stats.min_encode_time_us / 1000.0);
+    LOG_INFO("FFmpegEncoderStats: avg_encode_time(ms): {}", avg_encode_time / 1000.0);
+}
+#endif
+
 #endif

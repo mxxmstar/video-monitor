@@ -450,10 +450,11 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
     uint32_t convert_max_us = 0;
     uint32_t convert_avg_us = 0;
 
+    // 这里先硬编码一个视频宽高，防止converter打开失败
     MediaFrameConverterConfig convert_config;
     convert_config.backend = ConvertBackend::FFmpeg;
-    convert_config.video.width = video_stream_info.Video().width;
-    convert_config.video.height = video_stream_info.Video().height;
+    convert_config.video.width = video_stream_info.Video().width > 0 ? video_stream_info.Video().width : 1920;
+    convert_config.video.height = video_stream_info.Video().height > 0 ? video_stream_info.Video().height : 1080;
     convert_config.video.pixel_format = PixelFormat::kI420;
 
     EncoderConfig encoder_config;
@@ -463,8 +464,8 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
     encoder_config.thread_count = 1;
 
     VideoEncoderConfig& video_enc_cfg = encoder_config.video();
-    video_enc_cfg.width = video_stream_info.Video().width;
-    video_enc_cfg.height = video_stream_info.Video().height;
+    video_enc_cfg.width = video_stream_info.Video().width > 0 ? video_stream_info.Video().width : 1920;
+    video_enc_cfg.height = video_stream_info.Video().height > 0 ? video_stream_info.Video().height : 1080;
     LOG_INFO("Video h x w: {} x {}", video_enc_cfg.height, video_enc_cfg.width);
     video_enc_cfg.fps_num = 25;
     video_enc_cfg.fps_den = 1;
@@ -502,11 +503,6 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
                   decoded_frames, frame->Width(), frame->Height(),
                   static_cast<int>(frame->PixelFormat()), frame->time.pts_us);
 
-
-        if (!converter.Open(convert_config)) {
-            LOG_ERROR("Failed to open frame converter: {}", MediaFrameConverter::LastError());
-            return;
-        }
 
         std::shared_ptr<MediaFrame> converted_frame;
         auto before_convert_time = std::chrono::steady_clock::now();
@@ -555,6 +551,14 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
 
     if (!encoder.Open(encoder_config)) {
         LOG_ERROR("Failed to open video encoder");
+        decoder.Close();
+        puller.Close();
+        return 1;
+    }
+
+    if (!converter.Open(convert_config)) {
+        LOG_ERROR("Failed to open frame converter: {}", MediaFrameConverter::LastError());
+        encoder.Close();
         decoder.Close();
         puller.Close();
         return 1;
@@ -660,8 +664,13 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
     LOG_INFO("=======================");
     LOG_INFO("Decode stats: decode {} frames, min decode time: {} us, max decode time: {} us, avg decode time: {} us, total decode time: {} us", decoded_frames, decode_min_us, decode_max_us, decode_avg_us, decode_total_us);
     decoder.PrintStats();
-    // LOG_INFO("Convert stats: convert {} frames, min convert time: {} us, max convert time: {} us, avg convert time: {} us, total convert time: {} us", converted_frames, convert_min_us, convert_max_us, convert_avg_us, convert_total_us);
-    // LOG_INFO("Encode stats: encode {} frames, min encode time: {} us, max encode time: {} us, avg encode time: {} us, total encode time: {} us", encoded_frames, encode_min_us, encode_max_us, encode_avg_us, encode_total_us);
+    LOG_INFO("=======================");
+    converter.PrintStats();
+    LOG_INFO("=======================");
+    encoder.PrintStats();
+    LOG_INFO("Convert stats: convert {} frames, min convert time: {} us, max convert time: {} us, avg convert time: {} us, total convert time: {} us", converted_frames, convert_min_us, convert_max_us, convert_avg_us, convert_total_us);
+    LOG_INFO("=======================");
+    LOG_INFO("Encode stats: encode {} frames, min encode time: {} us, max encode time: {} us, avg encode time: {} us, total encode time: {} us", encoded_frames, encode_min_us, encode_max_us, encode_avg_us, encode_total_us);
     // LOG_INFO("Diagnostic: " << video_packet_count
     //     << " video packet(s) consumed from " << input_packet_count
     //     << " input packet(s)");
