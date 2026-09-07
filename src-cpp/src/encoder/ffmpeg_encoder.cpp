@@ -277,15 +277,15 @@ EncodedTrackInfo FFmpegEncoder::GetOutputInfo() const {
     info.time_base = {codec_ctx_->time_base.num, codec_ctx_->time_base.den};
 
     if (config_.is_video()) {
-        info.width = codec_ctx_->width;
-        info.height = codec_ctx_->height;
+        info.video().width = codec_ctx_->width;
+        info.video().height = codec_ctx_->height;
         if (codec_ctx_->framerate.den > 0 && codec_ctx_->framerate.num > 0) {
-            info.fps = static_cast<float>(codec_ctx_->framerate.num) /
+            info.video().fps = static_cast<float>(codec_ctx_->framerate.num) /
                        static_cast<float>(codec_ctx_->framerate.den);
         }
     } else if (config_.is_audio()) {
-        info.sample_rate = codec_ctx_->sample_rate;
-        info.channels = codec_ctx_->ch_layout.nb_channels;
+        info.audio().sample_rate = codec_ctx_->sample_rate;
+        info.audio().channels = codec_ctx_->ch_layout.nb_channels;
     }
 
     if (codec_ctx_->extradata && codec_ctx_->extradata_size > 0) {

@@ -2,6 +2,7 @@
 #include "media/decoder/ffmpeg_decoder.h"
 #include "media/converter/media_frame_converter.h"
 #include "media/encoder/ffmpeg_encoder.h"
+#include "media/pusher/ffmpeg_muxer.h"
 #include "media/simple_buffer.h"
 #include "common/log/logger.h"
 
@@ -453,8 +454,8 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
     // 这里先硬编码一个视频宽高，防止converter打开失败
     MediaFrameConverterConfig convert_config;
     convert_config.backend = ConvertBackend::FFmpeg;
-    convert_config.video.width = video_stream_info.Video().width > 0 ? video_stream_info.Video().width : 1920;
-    convert_config.video.height = video_stream_info.Video().height > 0 ? video_stream_info.Video().height : 1080;
+    convert_config.video.width = video_stream_info.video().width > 0 ? video_stream_info.video().width : 1920;
+    convert_config.video.height = video_stream_info.video().height > 0 ? video_stream_info.video().height : 1080;
     convert_config.video.pixel_format = PixelFormat::kI420;
 
     EncoderConfig encoder_config;
@@ -464,8 +465,8 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
     encoder_config.thread_count = 1;
 
     VideoEncoderConfig& video_enc_cfg = encoder_config.video();
-    video_enc_cfg.width = video_stream_info.Video().width > 0 ? video_stream_info.Video().width : 1920;
-    video_enc_cfg.height = video_stream_info.Video().height > 0 ? video_stream_info.Video().height : 1080;
+    video_enc_cfg.width = video_stream_info.video().width > 0 ? video_stream_info.video().width : 1920;
+    video_enc_cfg.height = video_stream_info.video().height > 0 ? video_stream_info.video().height : 1080;
     LOG_INFO("Video h x w: {} x {}", video_enc_cfg.height, video_enc_cfg.width);
     video_enc_cfg.fps_num = 25;
     video_enc_cfg.fps_den = 1;
@@ -484,6 +485,9 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
     uint32_t encode_min_us = UINT32_MAX;
     uint32_t encode_max_us = 0;
     uint32_t encode_avg_us = 0;
+
+    FFmpegMuxer muxer;
+    int64_t muxed_packets = 0;
 
     decoder.SetFrameCallback([&](std::shared_ptr<MediaFrame> frame) {
         if (!frame || frame->type != MediaType::VIDEO) {
@@ -538,6 +542,13 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
             ++encoded_packets;            
             LOG_INFO("Encoded packet {}: size={}, pts={}, keyframe={}", encoded_packets,
                       (packet->buffer ? packet->buffer->Size() : 0), packet->pts, packet->keyframe);
+            
+            // 写入 muxer
+            if (!muxer.Write(*packet)) {
+                LOG_ERROR("Failed to write packet {} to muxer", encoded_packets);
+            } else {
+                ++muxed_packets;
+            }
         }
     });
     
@@ -563,6 +574,42 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
         puller.Close();
         return 1;
     }
+
+    // 获取编码器输出信息，用于配置 muxer
+    EncodedTrackInfo encoded_track_info = encoder.GetOutputInfo();
+    if (!encoded_track_info.is_valid()) {
+        LOG_ERROR("Failed to get valid encoded track info from encoder");
+        converter.Close();
+        encoder.Close();
+        decoder.Close();
+        puller.Close();
+        return 1;
+    }
+
+    // 构造 MediaTrackConfig 用于 muxer
+    MediaTrackConfig muxer_config;
+    muxer_config.media_type = encoded_track_info.media_type;
+    muxer_config.codec_type = encoded_track_info.codec_type;
+    muxer_config.time_base_num = encoded_track_info.time_base.num;
+    muxer_config.time_base_den = encoded_track_info.time_base.den;
+    muxer_config.extra_data = encoded_track_info.extra_data;
+    
+    VideoTrackConfig& video_track = std::get<VideoTrackConfig>(muxer_config.track_config);
+    video_track.width = std::get<VideoTrackInfo>(encoded_track_info.specific).width;
+    video_track.height = std::get<VideoTrackInfo>(encoded_track_info.specific).height;
+    video_track.fps = std::get<VideoTrackInfo>(encoded_track_info.specific).fps;
+
+    // 打开 muxer
+    const std::string output_file = "test.mp4";
+    if (!muxer.Open(output_file, muxer_config)) {
+        LOG_ERROR("Failed to open muxer for {}", output_file);
+        converter.Close();
+        encoder.Close();
+        decoder.Close();
+        puller.Close();
+        return 1;
+    }
+    LOG_INFO("Muxer opened: {}", output_file);
 
     int packet_count = 0;
     auto start_time = std::chrono::steady_clock::now();
@@ -649,28 +696,36 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
         ++encoded_packets;
         LOG_INFO("Flush packet {}: size={}, pts={}, keyframe={}", encoded_packets,
                  packet->buffer ? packet->buffer->Size() : 0, packet->pts, packet->keyframe);
+        
+        // 写入 muxer
+        if (!muxer.Write(*packet)) {
+            LOG_ERROR("Failed to write flush packet {} to muxer", encoded_packets);
+        } else {
+            ++muxed_packets;
+        }
     }
 
     // 先 Flush 再 Close：Close 只释放 AVCodecContext，不会主动输出缓存帧。
     decoder.Close();
     encoder.Close();
+    muxer.Close();
     puller.Close();
 
     // 成功结果只表达测试真正验证的条件：已经解码出目标数量的视频帧。
     // video_packet_count 是过程诊断数据，不能作为“10 帧必须来自 10 包”
     // 的断言依据。
-    LOG_INFO("FFmpegPuller -> FFmpegDecoder -> MediaFrameConverter -> FFmpegEncoder test passed");
-    LOG_INFO("decoded_frames: {}, converted_frames: {}, encoded_frames: {}, encoded_packets: {}", decoded_frames, converted_frames, encoded_frames, encoded_packets);
+    LOG_INFO("FFmpegPuller -> FFmpegDecoder -> MediaFrameConverter -> FFmpegEncoder -> FFmpegMuxer test passed");
+    LOG_INFO("Muxed packets: {}", muxed_packets);
     LOG_INFO("=======================");
-    LOG_INFO("Decode stats: decode {} frames, min decode time: {} us, max decode time: {} us, avg decode time: {} us, total decode time: {} us", decoded_frames, decode_min_us, decode_max_us, decode_avg_us, decode_total_us);
     decoder.PrintStats();
     LOG_INFO("=======================");
     converter.PrintStats();
     LOG_INFO("=======================");
     encoder.PrintStats();
-    LOG_INFO("Convert stats: convert {} frames, min convert time: {} us, max convert time: {} us, avg convert time: {} us, total convert time: {} us", converted_frames, convert_min_us, convert_max_us, convert_avg_us, convert_total_us);
     LOG_INFO("=======================");
-    LOG_INFO("Encode stats: encode {} frames, min encode time: {} us, max encode time: {} us, avg encode time: {} us, total encode time: {} us", encoded_frames, encode_min_us, encode_max_us, encode_avg_us, encode_total_us);
+    // LOG_INFO("Convert stats: convert {} frames, min convert time: {} us, max convert time: {} us, avg convert time: {} us, total convert time: {} us", converted_frames, convert_min_us, convert_max_us, convert_avg_us, convert_total_us);
+    LOG_INFO("=======================");
+    // LOG_INFO("Encode stats: encode {} frames, min encode time: {} us, max encode time: {} us, avg encode time: {} us, total encode time: {} us", encoded_frames, encode_min_us, encode_max_us, encode_avg_us, encode_total_us);
     // LOG_INFO("Diagnostic: " << video_packet_count
     //     << " video packet(s) consumed from " << input_packet_count
     //     << " input packet(s)");

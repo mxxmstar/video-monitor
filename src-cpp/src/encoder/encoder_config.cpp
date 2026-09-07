@@ -48,19 +48,19 @@ bool EncoderConfig::is_valid() const {
     if (media_type == MediaType::AUDIO) {
         if (audio().sample_rate <= 0 || audio().channels <= 0) {
             LOG_ERROR("Invalid audio config: sample_rate or channels is <= 0");
-            audio().Dump();
+            // audio().Dump();
             return false;
         }
     } else if (media_type == MediaType::VIDEO) {
         video().Dump();
         if (video().width <= 0 || video().height <= 0) {
             LOG_ERROR("Invalid video config: width or height is <= 0");
-            video().Dump();
+            // video().Dump();
             return false;
         }
         if (video().fps_num <= 0 || video().fps_den <= 0) {
             LOG_ERROR("Invalid video config: fps_num or fps_den is <= 0");
-            video().Dump();
+            // video().Dump();
             return false;
         }
     } else {
@@ -69,3 +69,60 @@ bool EncoderConfig::is_valid() const {
     }
     return true;
 }
+
+bool EncodedTrackInfo::is_valid() const {
+    if (media_type == MediaType::AUDIO) {
+        if (audio().sample_rate <= 0 || audio().channels <= 0) {
+            LOG_ERROR("Invalid audio config: sample_rate or channels is <= 0");
+            // audio().Dump();
+            return false;
+        }
+    } else if (media_type == MediaType::VIDEO) {
+        //video().Dump();
+        if (video().width <= 0 || video().height <= 0) {
+            LOG_ERROR("Invalid video config: width or height is <= 0");
+            // video().Dump();
+            return false;
+        }
+        if (video().fps <= 0) {
+            LOG_ERROR("Invalid video config: fps is <= 0");
+            // video().Dump();
+            return false;
+        }
+    } else {
+        LOG_ERROR("Invalid media_type: {}", static_cast<int>(media_type));
+        return false;
+    }
+    return true;
+}
+
+bool EncodedTrackInfo::is_video() const {
+    return media_type == MediaType::VIDEO;
+}
+bool EncodedTrackInfo::is_audio() const {
+    return media_type == MediaType::AUDIO;
+}
+
+AudioTrackInfo& EncodedTrackInfo::audio() {
+    return std::get<AudioTrackInfo>(specific);
+}
+
+VideoTrackInfo& EncodedTrackInfo::video() {
+    return std::get<VideoTrackInfo>(specific);
+}
+
+const AudioTrackInfo& EncodedTrackInfo::audio() const {
+    if (is_audio()) {
+        return std::get<AudioTrackInfo>(specific);
+    }
+    static AudioTrackInfo empty;
+    return empty;
+}
+const VideoTrackInfo& EncodedTrackInfo::video() const {
+    if (is_video()) {
+        return std::get<VideoTrackInfo>(specific);
+    }
+    static VideoTrackInfo empty;
+    return empty;
+}
+

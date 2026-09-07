@@ -48,13 +48,13 @@ struct MediaStreamInfo {
     template<typename T>
     const T& get_detail() const { return std::get<T>(detail); }
 
-    VideoStreamInfo Video() const {
+    VideoStreamInfo video() const {
         if (media_type == MediaType::VIDEO) {
             return std::get<VideoStreamInfo>(detail);
         }
         return VideoStreamInfo{};
     }
-    AudioStreamInfo Audio() const {
+    AudioStreamInfo audio() const {
         if (media_type == MediaType::AUDIO) {
             return std::get<AudioStreamInfo>(detail);
         }
@@ -68,10 +68,10 @@ struct MediaStreamInfo {
                  stream_index, static_cast<int>(codec_type), time_base.toString());
 
         if (media_type == MediaType::VIDEO) {
-            auto video_info = Video();
+            auto video_info = video();
             video_info.Dump();
         } else {
-            auto audio_info = Audio();
+            auto audio_info = audio();
             audio_info.Dump();
         }
 

@@ -68,15 +68,38 @@ struct EncoderConfig {
     const VideoEncoderConfig& video() const;
 };
 
+/// @brief 视频轨道信息
+struct VideoTrackInfo {
+    int width{0};                                // 视频宽度
+    int height{0};                               // 视频高度
+    float fps{0.0f};                             // 帧率
+};
+
+/// @brief 音频轨道信息
+struct AudioTrackInfo {
+    int sample_rate{0};                          // 采样率
+    int channels{0};                             // 通道数
+};
+
 /// @brief 编码后的轨道信息
 struct EncodedTrackInfo {
     MediaType media_type{MediaType::UNKNOWN};    // 媒体类型（视频/音频）
     CodecType codec_type{CodecType::UNKNOWN};    // 编码格式（H264/H265/AAC/OPUS）
     Rational time_base{1, 1000000};             // 编码器使用的时间基（如 1/1000000）
-    int width{0};                                // 视频宽度
-    int height{0};                               // 视频高度
-    float fps{0.0f};                             // 帧率
-    int sample_rate{0};                          // 采样率
-    int channels{0};                             // 通道数
     std::vector<std::uint8_t> extra_data;        // 当前编码会话的 codec extradata
+    
+    std::variant<VideoTrackInfo, AudioTrackInfo> specific;  // 轨道信息，根据 media_type 分别为 VideoTrackInfo 或 AudioTrackInfo
+    int64_t bitrate{2'000'000};      // 目标码率(bps)
+
+    bool is_valid() const;
+    
+    bool is_video() const;
+    bool is_audio() const;
+
+    AudioTrackInfo& audio();
+    VideoTrackInfo& video();
+
+    const AudioTrackInfo& audio() const;
+    const VideoTrackInfo& video() const;
 };
+
