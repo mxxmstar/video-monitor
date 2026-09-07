@@ -86,7 +86,7 @@ private:
     const AVCodec* findAudioEncoder(AVCodecID codec_id, AVSampleFormat input_fmt,
             const std::string& encoder_name, AVSampleFormat& encoder_fmt) const;    
 
-    /// @brief 解析帧 pts，若帧的 pts 为 0，则自动分配递增的 pts
+    /// @brief 将微秒 pts 换算到编码器时间基；缺失时自动分配递增 pts
     int64_t resolveFramePts(const MediaFrame& frame);
 
     EncoderConfig config_;  ///< 编码器配置

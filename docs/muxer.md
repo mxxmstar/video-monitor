@@ -266,3 +266,119 @@ muxer 会根据 `packet.keyframe` 设置 `AV_PKT_FLAG_KEY`。如果关键帧标�
 
 
 ## 11. 问题修复记录
+
+### 11.1 编码器输入帧错误沿用微秒时间戳
+
+#### 问题现象
+
+`MediaFrame` 的 `pts_us`、`duration_us` 统一使用微秒，而
+`avcodec_send_frame()` 接收的 `AVFrame::pts` 和 `AVFrame::duration` 必须使用
+`AVCodecContext::time_base`。如果直接把微秒值送给编码器，例如在
+`time_base=1/25` 时把一帧的 `duration_us=40000` 写成 `duration=40000`，编码器
+会把它解释为 40000 个 tick，也就是 1600 秒。
+
+只换算 `pts` 仍然不完整。`duration` 与 `pts` 使用相同单位，也必须一起换算，
+否则编码 packet 的时长和后续 muxer 时间轴仍会错误。
+
+#### 根因
+
+`MediaFrameToAVFrame()` 中间适配层暂时保留微秒刻度，但编码器在调用
+`avcodec_send_frame()` 前没有把所有相关字段切换到编码器时间基。
+
+#### 修复
+
+编码器在送帧前统一执行：
+
+```cpp
+constexpr AVRational kMicrosecondTimeBase{1, 1'000'000};
+
+input->pts = resolveFramePts(*frame);
+
+input->duration = IsValidTimestamp(frame->time.duration_us)
+    ? av_rescale_q(
+          frame->time.duration_us,
+          kMicrosecondTimeBase,
+          codec_ctx_->time_base)
+    : 0;
+```
+
+同时完成以下处理：
+
+- 设置 `input->time_base = codec_ctx_->time_base`，明确帧当前使用的刻度。
+- 输入帧不向编码器传递解码阶段的 `pkt_dts`，将其设置为 `AV_NOPTS_VALUE`。
+- 启用 `AV_CODEC_FLAG_FRAME_DURATION`，否则 FFmpeg 编码器会忽略
+  `AVFrame::duration`。
+- 当 `pts_us` 缺失时，自动生成的 `next_pts_` 也继续使用编码器时间基。
+
+以 25 fps、`time_base=1/25` 为例：
+
+```text
+pts_us      = 1,000,000 us -> pts      = 25 tick
+duration_us =    40,000 us -> duration =  1 tick
+```
+
+### 11.2 本地输出文件继承上游绝对时间轴
+
+#### 问题现象
+
+RTSP 等实时流可能已经运行很久，编码 packet 的首个 `PTS/DTS` 因此不是 0。
+如果本地 MP4 等文件直接沿用这条时间轴，文件会出现较大的非零起始时间，
+影响播放器显示、seek 和时长判断。
+
+网络推流则不同。RTSP、RTMP 等输出需要保持连续的实时流时间轴，不能无条件
+将时间戳归零。
+
+#### 根因
+
+原来的 `FFmpegMuxer::Write()` 只调用 `av_packet_rescale_ts()` 将 packet 时间戳
+换算到输出流时间基，没有区分本地文件和网络 URL，也没有记录文件首包的
+时间戳偏移。
+
+#### 修复
+
+`Open()` 根据 `output_url` 判断输出类型：
+
+```cpp
+const char* protocol = avio_find_protocol_name(output_url.c_str());
+normalize_timestamps_ =
+    protocol != nullptr && std::strcmp(protocol, "file") == 0;
+```
+
+FFmpeg 的协议识别可以同时覆盖普通相对路径、绝对路径、Windows 盘符路径和
+`file:` URL。RTSP 等网络输出不会启用归零。
+
+本地文件写包流程调整为：
+
+```text
+1. 将 packet 的 pts/dts/duration 重标定到 AVStream::time_base
+2. 读取第一包中有效的 pts 和 dts
+3. 取两者中的最早值作为 timestamp_offset
+4. 第一包及所有后续包的有效 pts/dts 统一减去 timestamp_offset
+5. duration 只做时间基换算，不减偏移量
+```
+
+偏移量保存在输出流时间基中。这样即使后续 packet 的输入 `time_base` 不同，
+归零操作仍然使用同一刻度。
+
+如果第一包的 `PTS/DTS` 都无效，偏移量固定为 0，后续包不能再重新设置偏移，
+避免写到一半突然改变时间轴。`Open()` 和 `Close()` 都会重置归零状态，保证
+重复打开 muxer 时不会沿用上一个文件的偏移量。
+
+### 11.3 文件与网络输出行为
+
+| 输出类型 | 示例 | 首包偏移 | 后续包处理 |
+| --- | --- | --- | --- |
+| 本地文件 | `output.mp4`、`C:\video\output.mp4`、`file:output.mp4` | 第一包最早有效 `PTS/DTS` | 有效 `PTS/DTS` 统一减去偏移 |
+| 网络输出 | `rtsp://host/live/test`、`rtmp://host/live/test` | 不记录 | 仅重标定时间基，不归零 |
+
+无论输出类型如何，`duration` 都只通过 `av_packet_rescale_ts()` 换算到输出流
+时间基，不参与起始时间偏移。
+
+### 11.4 回归验证
+
+新增 `test_ffmpeg_timestamp_handling.cpp`，覆盖以下行为：
+
+- 编码器将 `1,000,000 us` 的 `pts` 正确换算为 `1/25` 时间基下的 25 tick。
+- 编码器将 `40,000 us` 的 `duration` 正确换算为 1 tick。
+- 使用非零起点编码三个 packet 后写入本地 MP4。
+- 重新读取 MP4，验证三个 packet 从 0 开始且保持连续的相对时间轴。

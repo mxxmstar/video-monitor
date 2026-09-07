@@ -18,6 +18,14 @@ std::string AvErrorString(int ret) {
     return buf;
 }
 
+/// @brief 根据输出 URL 判断是否为本地文件。
+///
+/// 相对路径和绝对路径按文件处理；带网络协议的 URL 不做时间戳归零。
+bool IsFileOutputUrl(const std::string& url) {
+    const char* protocol = avio_find_protocol_name(url.c_str());
+    return protocol != nullptr && std::strcmp(protocol, "file") == 0;
+}
+
 
 }
 
@@ -50,6 +58,9 @@ bool FFmpegMuxer::Open(const std::string& output_url, const MediaTrackConfig& co
     }
 
     output_url_ = output_url;
+    normalize_timestamps_ = IsFileOutputUrl(output_url_);
+    timestamp_offset_set_ = false;
+    timestamp_offset_ = 0;
 
     // 分配 AVFormatContext
     // 第三个参数 format_name 这里暂时不管，让 FFmpeg 自动选择
@@ -146,6 +157,9 @@ void FFmpegMuxer::Close() {
 
     video_stream_ = nullptr;
     header_written_ = false;
+    normalize_timestamps_ = false;
+    timestamp_offset_set_ = false;
+    timestamp_offset_ = 0;
     output_url_.clear();
 }
 
@@ -216,6 +230,36 @@ bool FFmpegMuxer::Write(const MediaPacket& packet) {
         av_packet,
         AVRational{packet.time_base.num, packet.time_base.den},
         video_stream_->time_base);
+
+    if (normalize_timestamps_) {
+        // 偏移量保存在输出流时间基中，后续包即使使用不同的输入时间基，
+        // 也能在统一刻度下归零。只使用第一包决定偏移；若它没有有效
+        // PTS/DTS，则偏移保持为 0，不能在后续包中途改变时间轴。
+        if (!timestamp_offset_set_) {
+            timestamp_offset_ = 0;
+            // 拿到第一个有效的 PTS，使用它作为偏移量
+            // I P帧的PTS >= DTS
+            if (av_packet->pts != AV_NOPTS_VALUE) {                
+                timestamp_offset_ = av_packet->pts;
+            }
+            if (av_packet->dts != AV_NOPTS_VALUE &&
+                (av_packet->pts == AV_NOPTS_VALUE || av_packet->dts < timestamp_offset_)) {
+                timestamp_offset_ = av_packet->dts;
+            }
+            timestamp_offset_set_ = true;
+
+            if (av_packet->pts != AV_NOPTS_VALUE || av_packet->dts != AV_NOPTS_VALUE) {
+                LOG_INFO("FFmpegMuxer normalizes local-file timestamps by {} stream tick(s)", timestamp_offset_);
+            }
+        }
+
+        if (av_packet->pts != AV_NOPTS_VALUE) {
+            av_packet->pts -= timestamp_offset_;
+        }
+        if (av_packet->dts != AV_NOPTS_VALUE) {
+            av_packet->dts -= timestamp_offset_;
+        }
+    }
 
     const int ret = av_interleaved_write_frame(format_ctx_, av_packet);
     if (ret < 0) {

@@ -34,5 +34,8 @@ private:
     std::string output_url_{};    
     AVFormatContext* format_ctx_ = nullptr;
     AVStream* video_stream_ = nullptr;
-    bool header_written_{false};
+    bool header_written_{false}; ///< 是否已写入头信息
+    bool normalize_timestamps_{false}; ///< 是否需要归一化时间戳
+    bool timestamp_offset_set_{false}; ///< 时间戳偏移量是否设置
+    int64_t timestamp_offset_{0}; ///< 时间戳偏移量
 };

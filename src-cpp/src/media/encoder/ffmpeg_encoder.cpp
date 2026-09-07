@@ -23,6 +23,8 @@ extern "C" {
 using namespace Media;
 namespace {
 
+constexpr AVRational kMicrosecondTimeBase{1, 1'000'000};
+
 /// @brief 获取 FFmpeg 错误码对应的错误字符串
 std::string AvErrorString(int ret) {
     char buf[AV_ERROR_MAX_STRING_SIZE];
@@ -159,6 +161,8 @@ bool FFmpegEncoder::Open(const EncoderConfig& cfg) {
     };
     codec_ctx_->bit_rate = cfg.bitrate;
     codec_ctx_->thread_count = cfg.thread_count;
+    // 告诉编码器 AVFrame::duration 是有效输入；否则 FFmpeg 会忽略该字段。
+    codec_ctx_->flags |= AV_CODEC_FLAG_FRAME_DURATION;
     if (cfg.global_header) {
         codec_ctx_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     }
@@ -362,6 +366,19 @@ bool FFmpegEncoder::encodeVideoFrame(FramePtr frame, std::vector<PacketPtr>& pac
         av_frame_free(&input);
         return false;
     }
+
+    // MediaFrame 的时间戳统一使用微秒，而 avcodec_send_frame() 要求输入
+    // AVFrame 的 pts/duration 使用 codec_ctx_->time_base。不能把例如
+    // 40,000 微秒直接当成 40,000 个 1/25 tick，否则一帧会被解释成 1,600 秒。
+    const AVRational encoder_time_base = codec_ctx_->time_base;
+    input->pts = resolveFramePts(*frame);
+    input->pkt_dts = AV_NOPTS_VALUE;
+    input->time_base = encoder_time_base;
+    input->duration = IsValidTimestamp(frame->time.duration_us)
+        ? av_rescale_q(frame->time.duration_us,
+                       kMicrosecondTimeBase,
+                       encoder_time_base)
+        : 0;
 
     // 发送帧到编码器，若编码器输出队列满（EAGAIN）则先取包再重试
     int ret = avcodec_send_frame(codec_ctx_, input);
@@ -686,7 +703,7 @@ const AVCodec* FFmpegEncoder::findAudioEncoder(AVCodecID codec_id, AVSampleForma
 int64_t FFmpegEncoder::resolveFramePts(const MediaFrame& frame) {
     if (IsValidTimestamp(frame.time.pts_us)) {
         // MediaFrame 明确使用微秒，送入 FFmpeg 前必须换算到编码器 time_base。
-        const int64_t pts = av_rescale_q(frame.time.pts_us, AVRational{1, 1'000'000},
+        const int64_t pts = av_rescale_q(frame.time.pts_us, kMicrosecondTimeBase,
             codec_ctx_ ? codec_ctx_->time_base : AVRational{1, 1'000'000});        
         // 递增 pts 计数器
         next_pts_ = std::max(next_pts_, pts + 1);
