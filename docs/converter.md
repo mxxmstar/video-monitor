@@ -74,6 +74,11 @@ AVFrame
 普通 MediaFrame
     buffer 持有 SimpleBuffer
     SimpleBuffer 持有连续字节数组
+
+FFmpeg 后端 MediaFrame
+    buffer 持有 FFmpegRawFrameBuffer
+    FFmpegRawFrameBuffer 持有 AVFrame
+    backend.ptr 指向同一个 AVFrame（非拥有）
 ```
 
 因此 converter 需要负责两个方向的适配：
@@ -83,7 +88,10 @@ mediaFrameToAVFrame()
     MediaFrame 的元数据和 buffer -> 一个可供 sws/swr 使用的 AVFrame
 
 avFrameToMediaFrame()
-    转换后的 AVFrame -> 独立拥有数据的 MediaFrame
+    转换后的 AVFrame -> 复制到 SimpleBuffer 的 MediaFrame
+
+AdoptAVFrame()
+    拥有所有权的 AVFrame -> 由 FFmpegRawFrameBuffer 直接接管
 ```
 
 ## 4. mediaFrameToAVFrame 做什么
@@ -99,7 +107,7 @@ input.backend.ptr != nullptr
 
 converter 把 `backend.ptr` 当作 `AVFrame*`，调用 `av_frame_ref()` 引用它的数据。
 
-这里的 `backend.ptr` 只是后端对象指针，不是独立的所有权。输入的 `buffer` 必须继续存活，因为当前解码器使用的 `FFmpegFrameBuffer` 负责释放真正的 `AVFrame`。
+这里的 `backend.ptr` 只是后端对象指针，不是独立的所有权。输入的 `buffer` 必须继续存活，因为 `FFmpegFrameBuffer` 或 `FFmpegRawFrameBuffer` 负责释放真正的 `AVFrame`。
 
 `av_frame_ref()` 会增加 FFmpeg 数据缓冲区的引用计数，所以 converter 释放自己的临时 AVFrame 时，不会释放输入帧仍在使用的数据。
 
@@ -242,28 +250,39 @@ BackendHandle::FFMPEG
     MediaFrame 还关联一个 FFmpeg 对象，backend.ptr 指向该对象
 ```
 
-当前解码器产生的 FFmpeg 后端 MediaFrame 大致是：
+当前 decoder 和 converter 都输出不复制的 raw 形式：
 
 ```text
 MediaFrame.buffer
-    -> FFmpegFrameBuffer
+    -> FFmpegRawFrameBuffer
         -> 拥有 AVFrame
 
 MediaFrame.backend.ptr
     -> 指向同一个 AVFrame
-        -> 非拥有指针
+    -> 非拥有指针
 ```
 
-converter 的输出经过 `avFrameToMediaFrame()` 后，会复制到新的 `SimpleBuffer`。此时输出不再依赖 FFmpeg 输出 AVFrame 的生命周期，所以设置：
+converter 的内部输出路径使用 `AdoptAVFrame()`，由
+`FFmpegRawFrameBuffer` 接管 AVFrame，不再复制到新的 `SimpleBuffer`：
 
 ```cpp
-media_frame->backend.type = BackendHandle::NONE;
-media_frame->backend.ptr = nullptr;
+media_frame->backend.type = BackendHandle::FFMPEG;
+media_frame->backend.ptr = raw_buffer->GetFrame();
 ```
 
-这并不表示输出没有所有权。恰恰相反，输出数据由 `media_frame->buffer` 中的 `SimpleBuffer` 独立拥有，后续编码器可以安全地读取这个 `MediaFrame`。
+`backend.ptr` 本身不负责释放。真正的所有权在
+`MediaFrame.buffer -> FFmpegRawFrameBuffer`，因此只要 `MediaFrame` 还活着，
+编码器就可以通过 `av_frame_ref()` 引用这个 AVFrame 的数据。
 
-如果将来希望编码器直接接收 FFmpeg AVFrame 的零拷贝输出，也可以保留 `BackendHandle::FFMPEG`，但必须同时保证 `buffer` 持有对应的 AVFrame，并且所有使用者都遵守这个生命周期约定。当前公共 converter 选择复制到 `SimpleBuffer`，是为了让接口不依赖 FFmpeg 对象。
+`FFmpegRawFrameBuffer::Data()` 返回空指针、`Size()` 返回 0，这是有意的：
+多平面 AVFrame 没有一个通用的连续字节区。需要访问像素或样本时，应通过
+`GetFrame()` 或 `PlaneData()`；只接受连续 `IMediaBuffer` 的模块仍应使用
+`FFmpegFrameBuffer` 或 `SimpleBuffer`。
+
+`FFmpegFrameBuffer` 仍保留给必须读取连续字节区的兼容场景，但 decoder、
+converter 不再使用它。当前拉流、解码、转换、编码链路使用 AVFrame 引用传递；
+只有 `sws_scale()` 或 `swr_convert()` 在确实改变格式、尺寸、采样率时才会生成
+新的目标数据。
 
 ## 9. 时间戳约定
 
@@ -290,7 +309,8 @@ kNoTimestamp
 当前实现用于学习和跑通最小链路，限制包括：
 
 1. 只实现 FFmpeg 后端，尚未实现 OpenCV 和 SIMD。
-2. `MediaFrameConverter` 输出统一复制到 `SimpleBuffer`，暂时不是零拷贝。
+2. decoder 和 converter 已避免 `AVFrame -> SimpleBuffer -> AVFrame` 的额外
+   拷贝；`FFmpegRawFrameBuffer` 不能提供连续 `Data()/Size()` 接口。
 3. 视频和音频配置在 `Open()` 时固定；输入媒体类型必须对应已打开的转换器。
 4. 音频声道布局接口当前使用 `uint64_t` native channel mask，不能完整表达自定义声道布局。
 5. converter 当前不负责编码器 time_base 的时间戳换算。
@@ -304,5 +324,90 @@ kNoTimestamp
 2. 增加 packed 音频和多声道 planar 音频的输入输出测试。
 3. 将 converter 接入 encoder，验证“解码 -> 转换 -> 编码”的完整链路。
 4. 在保持 `MediaFrame -> MediaFrame` 公共接口不变的前提下，增加 SIMD 后端。
-5. 根据性能需求，再评估 AVFrame 零拷贝和 buffer 池化。
+5. 根据性能需求，再评估 AVFrame 池化和跨线程复用。
 
+## 12. 问题记录
+
+### 12.1 编码帧率与输入帧率不匹配导致 MP4 DTS 非单调
+
+#### 现象
+
+运行下面的完整链路时，`RAW_FRAME_BUFFER=0`（非零拷贝）和
+`RAW_FRAME_BUFFER=1`（零拷贝）两种配置都会出现：
+
+```text
+FFmpegPuller -> FFmpegDecoder -> MediaFrameConverter -> FFmpegEncoder -> FFmpegMuxer
+```
+
+会周期性出现：
+
+```text
+Application provided invalid, non monotonically increasing dts to muxer
+av_interleaved_write_frame failed: Invalid argument
+```
+
+问题在大约每 5 到 6 帧出现一次。当前测试仍然会继续运行并最终打印 `test passed`，因为 muxer 写包失败只被记录，没有让测试失败。
+
+#### 实测数据
+
+输入流时间基为 `1/90000`，解码帧的时间戳间隔约为 `33.3 ms`，实际接近 30 FPS。例如：
+
+```text
+decoded pts_us=2100611 -> encoded pts=53
+decoded pts_us=2133878 -> encoded pts=53
+```
+
+测试中的编码器固定配置为 25 FPS，编码器时间基为 `1/25`，每个时间 tick 为 `40000 us`。因此相邻输入时间戳经过 `av_rescale_q()` 后可能落到同一个编码时间 tick，产生重复 PTS；由于配置了 `max_b_frames=0`，编码包的 DTS 通常也相同。
+
+例如首包时间戳为 50，MP4 输出时间基为 `1/12800` 时，重复的编码时间戳 53 会被 muxer 转换为：
+
+```text
+(53 - 50) * 512 = 1536
+```
+
+所以 FFmpeg 报告 `1536 >= 1536`。这证明重复 DTS 在进入 muxer 前已经产生。
+
+#### 原因
+
+问题与视频数据拷贝方式或 `FFmpegRawFrameBuffer` 的内存所有权无关，而是输入时间戳与编码器时间基不匹配：
+
+1. 输入帧实际约为 30 FPS，但测试编码器固定为 25 FPS。
+2. `FFmpegEncoder::resolveFramePts()` 将微秒时间戳量化到 `1/25`。
+3. `next_pts_` 只被更新，没有约束当前返回的 PTS 必须大于上一帧，因此重复 tick 会直接传给编码器。
+4. MP4 muxer 要求同一视频流的 DTS 严格递增，重复 DTS 会被 `av_interleaved_write_frame()` 拒绝。
+
+#### 验证结果
+
+将测试中的：
+
+```cpp
+video_enc_cfg.fps_num = 25;
+```
+
+修改为：
+
+```cpp
+video_enc_cfg.fps_num = 30;
+```
+
+后，输入流与编码器帧率匹配，当前 DTS 错误不再出现。
+
+#### 修复方向
+
+- 如果目标是固定 25 FPS，应在编码前执行明确的 CFR 重采样策略，例如按输出时间轴丢帧或补帧，并保证输出 PTS 严格递增。
+- 如果目标是保留输入帧率，应根据实际输入帧时间戳配置编码器，不要固定使用 25 FPS；同时应使用更细的编码时间基，例如 `1/90000` 或 `1/1000000`。
+- `resolveFramePts()` 应在存在有效输入 PTS 时同时保证返回值单调递增，而不是只更新 `next_pts_`。
+- 完善测试断言：统计 `muxer.Write()` 失败次数，任何 packet 写入失败都应使测试失败；日志也应同时打印 packet 的 `pts`、`dts`、`duration` 和 `time_base`。
+
+### 12.2 零拷贝对 converter 性能的影响
+
+在相同测试链路下，零拷贝路径的 converter 耗时明显低于非零拷贝路径。当前实测统计如下：
+
+| 路径 | max | min | avg |
+| --- | ---: | ---: | ---: |
+| 零拷贝 | 2.068 ms | 0.463 ms | 0.675 ms |
+| 非零拷贝 | 6.634 ms | 1.322 ms | 1.798 ms |
+
+零拷贝路径的平均转换耗时约为非零拷贝路径的 37.5%。主要原因是非零拷贝路径需要将 AVFrame 平面数据复制到连续 buffer，后续编码前还需要再次构造或复制 AVFrame；零拷贝路径则通过 `FFmpegRawFrameBuffer` 保留 AVFrame，并使用 `av_frame_ref()` 传递底层数据。
+
+以上数据是当前机器和当前测试流下的实测结果，实际数值会受到分辨率、像素格式、缩放参数、CPU 和输入帧率影响。

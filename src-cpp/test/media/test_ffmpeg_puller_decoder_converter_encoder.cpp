@@ -3,6 +3,7 @@
 #include "media/converter/media_frame_converter.h"
 #include "media/encoder/ffmpeg_encoder.h"
 #include "media/pusher/ffmpeg_muxer.h"
+#include "media/ffmpeg_raw_frame_buffer.h"
 #include "media/simple_buffer.h"
 #include "common/log/logger.h"
 
@@ -306,6 +307,8 @@ int RunFfmpegConverterTest() {
     }
 
     const auto* converted_video_meta = video_output->VideoMeta();
+    const auto* converted_video_buffer =
+        dynamic_cast<const FFmpegRawFrameBuffer*>(video_output->buffer.get());
     const bool video_ok =
         video_output->type == MediaType::VIDEO &&
         converted_video_meta != nullptr &&
@@ -313,9 +316,13 @@ int RunFfmpegConverterTest() {
         converted_video_meta->height == 2 &&
         converted_video_meta->pixel_format == PixelFormat::kNV12 &&
         converted_video_meta->plane_count == 2 &&
-        video_output->buffer != nullptr &&
-        video_output->buffer->Size() > 0 &&
-        video_output->backend.type == BackendHandle::NONE &&
+        converted_video_buffer != nullptr &&
+        converted_video_buffer->GetFrame() ==
+            static_cast<const AVFrame*>(video_output->backend.ptr) &&
+        converted_video_buffer->PlaneData(0) != nullptr &&
+        converted_video_buffer->PlaneData(1) != nullptr &&
+        video_output->backend.type == BackendHandle::FFMPEG &&
+        video_output->backend.ptr != nullptr &&
         video_output->time.pts_us == video_input->time.pts_us;
 
     if (!video_ok) {
@@ -376,6 +383,8 @@ int RunFfmpegConverterTest() {
     }
 
     const auto* converted_audio_meta = audio_output->AudioMeta();
+    const auto* converted_audio_buffer =
+        dynamic_cast<const FFmpegRawFrameBuffer*>(audio_output->buffer.get());
     // 8000Hz -> 16000Hz 后，样本数应大致翻倍；具体边界可能受 swr 延迟
     // 和重采样实现影响，所以这里只要求输出为正数，而不写死精确数量。
     const bool audio_ok =
@@ -386,9 +395,12 @@ int RunFfmpegConverterTest() {
         converted_audio_meta->channels == 2 &&
         converted_audio_meta->nb_samples > 0 &&
         !converted_audio_meta->planar &&
-        audio_output->buffer != nullptr &&
-        audio_output->buffer->Size() > 0 &&
-        audio_output->backend.type == BackendHandle::NONE &&
+        converted_audio_buffer != nullptr &&
+        converted_audio_buffer->GetFrame() ==
+            static_cast<const AVFrame*>(audio_output->backend.ptr) &&
+        converted_audio_buffer->PlaneData(0) != nullptr &&
+        audio_output->backend.type == BackendHandle::FFMPEG &&
+        audio_output->backend.ptr != nullptr &&
         audio_output->time.pts_us == audio_input->time.pts_us;
 
     if (!audio_ok) {
@@ -468,6 +480,7 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
     video_enc_cfg.width = video_stream_info.video().width > 0 ? video_stream_info.video().width : 1920;
     video_enc_cfg.height = video_stream_info.video().height > 0 ? video_stream_info.video().height : 1080;
     LOG_INFO("Video h x w: {} x {}", video_enc_cfg.height, video_enc_cfg.width);
+    // video_enc_cfg.fps_num = 30;
     video_enc_cfg.fps_num = 25;
     video_enc_cfg.fps_den = 1;
     video_enc_cfg.pixel_format = PixelFormat::kI420;

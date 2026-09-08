@@ -2,6 +2,7 @@
 
 #include "media/converter/ffmpeg_audio_converter.h"
 #include "media/converter/ffmpeg_video_converter.h"
+#include "media/ffmpeg_raw_frame_buffer.h"
 #include "media/simple_buffer.h"
 #include "media/ffmpeg_format.h"
 
@@ -76,6 +77,99 @@ bool isBufferRangeValid(const MediaFrame& frame, int32_t offset, int32_t size) {
     return start <= frame.buffer->Size() && length <= frame.buffer->Size() - start;
 }
 
+
+/// @brief 从 AVFrame 填充 MediaFrame 的类型和元数据，不复制平面数据。
+/// Raw AVFrame 的平面地址不一定能用 offset 表示，所以这里的 offset 仅
+/// 保留为 0；实际平面地址由 FFmpegRawFrameBuffer::PlaneData() 提供。
+/// 只要 MediaFrame.backend.type 为 FFMPEG，MediaFrameToAVFrame() 就会走
+/// av_frame_ref() 快速路径，不会根据这些 offset 重新读取 buffer。
+///
+/// @param frame AVFrame 引用
+/// @param media_type 输出的媒体类型
+/// @param meta 输出的元数据
+/// @param error 输出的错误信息
+/// @return true 成功 false 失败
+bool FillRawFrameMeta(const AVFrame& frame, MediaType& media_type, FrameMeta& meta, std::string& error) {
+    if (frame.width > 0 && frame.height > 0) {
+        const auto format = static_cast<AVPixelFormat>(frame.format);
+        const PixelFormat pixel_format = FromAVPixelFormat(format);
+        const int plane_count = av_pix_fmt_count_planes(format);
+        if (pixel_format == PixelFormat::kUnknown || !frame.data[0] || plane_count <= 0 || plane_count > 8) {
+            error = "Unsupported or empty video AVFrame";
+            return false;
+        }
+
+        VideoFrameMeta video{};
+        video.pixel_format = pixel_format;
+        video.width = frame.width;
+        video.height = frame.height;
+        video.plane_count = plane_count;
+
+        // 元数据中的 stride 仍然保留，便于知道每行在 AVFrame 中的布局。
+        // offset 对 raw buffer 没有意义，因此统一为 0。
+        for (int plane = 0; plane < plane_count; ++plane) {
+            const int stride = plane < AV_NUM_DATA_POINTERS ? frame.linesize[plane] : 0;
+            video.plane_info[plane].offset = 0;
+            video.plane_info[plane].stride = stride;
+            video.plane_info[plane].size = 0;
+        }
+
+        media_type = MediaType::VIDEO;
+        meta = video;
+        return true;
+    }
+
+    if (frame.nb_samples > 0 && frame.ch_layout.nb_channels > 0) {
+        const auto format = static_cast<AVSampleFormat>(frame.format);
+        const SampleFormat sample_format = FromAVSampleFormat(format);
+        const int channels = frame.ch_layout.nb_channels;
+        const int bytes_per_sample = av_get_bytes_per_sample(format);
+        const bool planar = av_sample_fmt_is_planar(format) != 0;
+        const int plane_count = planar ? channels : 1;
+        if (sample_format == SampleFormat::Unknown || frame.sample_rate <= 0 ||
+            bytes_per_sample <= 0 || plane_count <= 0 || plane_count > 8 ||
+            !frame.extended_data) {
+            error = "Unsupported or empty audio AVFrame";
+            return false;
+        }
+
+        AudioFrameMeta audio{};
+        audio.sample_format = sample_format;
+        audio.sample_rate = frame.sample_rate;
+        audio.channels = channels;
+        audio.channel_layout = frame.ch_layout.order == AV_CHANNEL_ORDER_NATIVE
+            ? frame.ch_layout.u.mask : 0;
+        audio.nb_samples = frame.nb_samples;
+        audio.bytes_per_sample = bytes_per_sample;
+        audio.planar = planar;
+        audio.plane_count = plane_count;
+
+        const size_t one_plane_size = static_cast<size_t>(frame.nb_samples) *
+                                      static_cast<size_t>(bytes_per_sample);
+        const size_t packed_plane_size = one_plane_size * static_cast<size_t>(channels);
+        const size_t max_int32 = static_cast<size_t>(std::numeric_limits<int32_t>::max());
+        if (one_plane_size > max_int32 || packed_plane_size > max_int32) {
+            error = "Audio AVFrame plane size exceeds MediaFrame metadata range";
+            return false;
+        }
+        for (int plane = 0; plane < plane_count; ++plane) {
+            if (!frame.extended_data[plane]) {
+                error = "Audio AVFrame plane is null";
+                return false;
+            }
+            audio.planes[plane].offset = 0;
+            audio.planes[plane].stride = static_cast<int32_t>(planar ? one_plane_size : packed_plane_size);
+            audio.planes[plane].size = static_cast<int32_t>(planar ? one_plane_size : packed_plane_size);
+        }
+
+        media_type = MediaType::AUDIO;
+        meta = audio;
+        return true;
+    }
+
+    error = "AVFrame is neither a valid video nor audio frame";
+    return false;
+}
 
 
 }  // namespace
@@ -229,6 +323,7 @@ bool MediaFrameConverter::ffmpegVideoConvert(const MediaFrame& input,
         return false;
     }
 
+#if !RAW_FRAME_BUFFER
     // 创建 MediaFrame 并将转换后的 AVFrame 转换为 MediaFrame
     // 注意：MediaFrame.buffer 仍然负责保持原始 AVFrame 的生命周期，backend.ptr 只是指向该对象的非拥有指针。
     output = std::make_shared<MediaFrame>();
@@ -239,6 +334,13 @@ bool MediaFrameConverter::ffmpegVideoConvert(const MediaFrame& input,
     }
 
     av_frame_free(&converted);
+#else
+    // 转换器已经把数据写入 converted。这里直接把 AVFrame 交给输出
+    // MediaFrame，避免再次打包到 SimpleBuffer。
+    if (!AdoptAVFrame(converted, output)) {
+        return false;
+    }
+#endif
     last_error_.clear();
     return true;
 }
@@ -268,6 +370,7 @@ bool MediaFrameConverter::ffmpegAudioConvert(const MediaFrame& input,
         return false;
     }
 
+#if !RAW_FRAME_BUFFER
     output = std::make_shared<MediaFrame>();
     if (!AvFrameToMediaFrame(*converted, output.get())) {
         output.reset();
@@ -276,6 +379,13 @@ bool MediaFrameConverter::ffmpegAudioConvert(const MediaFrame& input,
     }
 
     av_frame_free(&converted);
+#else
+    // 音频和视频使用相同的所有权转移规则：输出 MediaFrame 的 buffer
+    // 持有 AVFrame，backend.ptr 指向同一个 AVFrame 但不单独负责释放。
+    if (!AdoptAVFrame(converted, output)) {
+        return false;
+    }
+#endif
     last_error_.clear();
     return true;
 }
@@ -644,6 +754,42 @@ void MediaFrameConverter::SetMediaFrameTime(const AVFrame& input, MediaFrame* ou
     output->time.dts_us = input.pkt_dts == AV_NOPTS_VALUE ? kNoTimestamp : input.pkt_dts;
     output->time.duration_us = input.duration == AV_NOPTS_VALUE ? kNoTimestamp : input.duration;
 }
+
+bool MediaFrameConverter::AdoptAVFrame(AVFrame* av_frame, std::shared_ptr<MediaFrame>& output) {
+    output.reset();
+    if (!av_frame) {
+        last_error_ = "AVFrame is null";
+        return false;
+    }
+
+    // 先验证并生成元数据，再把 AVFrame 的所有权交给 raw buffer。
+    // 这样任何校验失败都仍由本函数负责释放传入的 AVFrame。
+    const auto frame_deleter = [](AVFrame* frame) {
+        av_frame_free(&frame);
+    };
+    std::unique_ptr<AVFrame, decltype(frame_deleter)> owned_frame(av_frame, frame_deleter);
+
+    MediaType media_type = MediaType::UNKNOWN;
+    FrameMeta meta;
+    if (!FillRawFrameMeta(*av_frame, media_type, meta, last_error_)) {
+        return false;
+    }
+
+    // make_shared 失败时 owned_frame 仍会释放 AVFrame。构造成功后再 release，
+    // 从而把唯一所有权明确转交给 FFmpegRawFrameBuffer。
+    auto raw_buffer = std::make_shared<FFmpegRawFrameBuffer>(owned_frame.get());
+    owned_frame.release();
+    MediaFrame result;
+    result.type = media_type;
+    result.meta = std::move(meta);
+    result.buffer = raw_buffer;
+    result.backend.type = BackendHandle::FFMPEG;
+    result.backend.ptr = raw_buffer->GetFrame();
+    SetMediaFrameTime(*raw_buffer->GetFrame(), &result);
+    output = std::make_shared<MediaFrame>(std::move(result));
+    return true;
+}
+
 
 void MediaFrameConverter::Close() {
     if (ffmpeg_video_converter_) {

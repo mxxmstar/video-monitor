@@ -79,7 +79,10 @@ public:
     MediaTime   time;                               ///< 时间戳信息
     FrameMeta meta;                                 ///< 媒体帧元数据            
 
-    std::shared_ptr<IMediaBuffer> buffer;           ///< packed 图像数据
+    // 普通帧通常由 SimpleBuffer 持有连续数据；FFmpeg 后端帧也可以由
+    // FFmpegRawFrameBuffer 持有多平面 AVFrame，此时不能通过 Data()/Size()
+    // 访问整帧，而应使用 backend.ptr 或 raw buffer 的平面接口。
+    std::shared_ptr<IMediaBuffer> buffer;           ///< 媒体数据缓冲区
     BackendHandle backend;                          ///< 所有权句柄
 
     /// @brief 获取视频元数据（若 type 为 VIDEO）

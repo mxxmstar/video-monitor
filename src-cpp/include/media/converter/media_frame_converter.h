@@ -112,10 +112,11 @@ public:
     /// @return 是否成功构建AVFrame
     static bool MediaFrameToAVFrame(const MediaFrame& input, AVFrame* av_frame);
     
-    /// @brief 构建媒体帧
+    /// @brief 复制构建媒体帧
     /// @param av_frame 输入AVFrame
     /// @param media_frame 输出媒体帧
     /// @return 是否成功构建媒体帧
+    /// @note 该接口不接管 av_frame，输出使用独立的 SimpleBuffer。
     static bool AvFrameToMediaFrame(const AVFrame& av_frame, MediaFrame* media_frame);
 
     /// @brief 设置 AVFrame 时间戳
@@ -127,6 +128,12 @@ public:
     /// @param input 输入 AVFrame
     /// @param output 输出 MediaFrame
     static void SetMediaFrameTime(const AVFrame& input, MediaFrame* output);
+
+    /// @brief 接管 AVFrame 并构建 Media帧
+    /// @param av_frame 输入 AVFrame
+    /// @param output 输出 Media帧 shared_ptr
+    /// @return 是否成功构建 Media帧
+    static bool AdoptAVFrame(AVFrame* av_frame, std::shared_ptr<MediaFrame>& output);
 
 private:
     /// @brief FFmpeg视频转换，基于swscale
@@ -141,7 +148,8 @@ private:
     /// @param output 输出音频帧
     /// @return 是否成功转换
     bool ffmpegAudioConvert(const MediaFrame& input,
-                            std::shared_ptr<MediaFrame>& output);    
+                            std::shared_ptr<MediaFrame>& output);
+
 
     VideoConvertConfig video_config_{};
     AudioConvertConfig audio_config_{};
