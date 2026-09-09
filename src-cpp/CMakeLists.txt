@@ -34,6 +34,9 @@ endforeach()
 find_package(Boost REQUIRED COMPONENTS system filesystem process)
 find_package(spdlog CONFIG REQUIRED)
 
+# 保留 packed 路径作为性能对照组；切换为 ON 时启用 raw AVFrame 路径。
+option(MEDIA_RAW_FRAME_BUFFER "Use non-copying raw AVFrame media buffers" OFF)
+
 # FFmpeg 配置
 set(FFMPEG_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ffmpeg-8.1")
 set(FFMPEG_INCLUDE_DIR "${FFMPEG_ROOT}/include")
@@ -79,6 +82,12 @@ target_link_libraries(common_lib
         Boost::process
         spdlog::spdlog
 )
+
+if(MEDIA_RAW_FRAME_BUFFER)
+    target_compile_definitions(common_lib PUBLIC RAW_FRAME_BUFFER=1)
+else()
+    target_compile_definitions(common_lib PUBLIC RAW_FRAME_BUFFER=0)
+endif()
 
 # 链接 FFmpeg 库
 target_link_libraries(common_lib

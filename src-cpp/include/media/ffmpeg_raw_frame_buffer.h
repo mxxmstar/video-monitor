@@ -4,7 +4,9 @@
 
 #include "media/i_media_buffer.h"
 
+#ifndef RAW_FRAME_BUFFER
 #define RAW_FRAME_BUFFER    0
+#endif
 
 
 struct AVFrame;
@@ -27,11 +29,17 @@ public:
     uint8_t* Data() override;
     const uint8_t* Data() const override;
 
+    ///@brief Raw AVFrame 不提供单一连续字节区。
+    bool IsContiguous() const override { return false; }
+
     ///@brief Raw AVFrame 不是连续 buffer，因此返回 0。
     size_t Size() const override;
 
     ///@brief 获取由本类持有的 AVFrame。
     AVFrame* GetFrame() const { return frame_; }
+
+    ///@brief 判断 AVFrame 是否包含当前媒体模块可访问的有效平面。
+    bool IsValid() const;
 
     ///@brief 获取指定平面数据。plane 从 0 开始。
     uint8_t* PlaneData(int plane);
@@ -39,6 +47,12 @@ public:
 
     ///@brief 获取 FFmpeg 根据格式计算出的平面数量。
     int PlaneCount() const;
+
+    ///@brief 获取指定平面的实际行跨度；无效索引返回 0。
+    int PlaneStride(int plane) const;
+
+    ///@brief 获取指定平面的可读字节数；无法计算时返回 0。
+    size_t PlaneSize(int plane) const;
 
 private:
     AVFrame* frame_{nullptr};  ///< 本类独占并负责释放的 AVFrame

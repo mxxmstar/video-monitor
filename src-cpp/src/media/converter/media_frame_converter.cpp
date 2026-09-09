@@ -2,6 +2,7 @@
 
 #include "media/converter/ffmpeg_audio_converter.h"
 #include "media/converter/ffmpeg_video_converter.h"
+#include "media/ffmpeg_frame_buffer.h"
 #include "media/ffmpeg_raw_frame_buffer.h"
 #include "media/simple_buffer.h"
 #include "media/ffmpeg_format.h"
@@ -174,6 +175,14 @@ bool FillRawFrameMeta(const AVFrame& frame, MediaType& media_type, FrameMeta& me
 
 }  // namespace
 
+void FFmpegAudioConverterDeleter::operator()(FFmpegAudioConverter* converter) const noexcept {
+    delete converter;
+}
+
+void FFmpegVideoConverterDeleter::operator()(FFmpegVideoConverter* converter) const noexcept {
+    delete converter;
+}
+
 MediaFrameConverter::MediaFrameConverter() = default;
 
 MediaFrameConverter::~MediaFrameConverter() {
@@ -224,7 +233,7 @@ bool MediaFrameConverter::Open(const MediaFrameConverterConfig& config) {
     }
 
     if (video_requested) {
-        ffmpeg_video_converter_ = std::make_unique<FFmpegVideoConverter>();
+        ffmpeg_video_converter_.reset(new FFmpegVideoConverter());
         if (!ffmpeg_video_converter_->Open(video_config_.width, video_config_.height,
                 ToAVPixelFormat(video_config_.pixel_format), video_config_.sws_flags)) {
             const std::string error = ffmpeg_video_converter_->LastError();
@@ -235,7 +244,7 @@ bool MediaFrameConverter::Open(const MediaFrameConverterConfig& config) {
     }
 
     if (audio_requested) {
-        ffmpeg_audio_converter_ = std::make_unique<FFmpegAudioConverter>();
+        ffmpeg_audio_converter_.reset(new FFmpegAudioConverter());
         if (!ffmpeg_audio_converter_->Open( audio_config_.channel_layout,
                 audio_config_.sample_rate, ToAVSampleFormat(audio_config_.sample_format))) {
             const std::string error = ffmpeg_audio_converter_->LastError();
@@ -402,6 +411,17 @@ bool MediaFrameConverter::MediaFrameToAVFrame(const MediaFrame& input, AVFrame* 
     // 临时 source 时不会影响输入 MediaFrame 的数据。
     if (input.backend.type == BackendHandle::FFMPEG && input.backend.ptr) {
         const auto* source = static_cast<const AVFrame*>(input.backend.ptr);
+        const auto* raw_buffer =
+            dynamic_cast<const FFmpegRawFrameBuffer*>(input.buffer.get());
+        const auto* packed_buffer =
+            dynamic_cast<const FFmpegFrameBuffer*>(input.buffer.get());
+        const bool backend_matches_buffer =
+            (raw_buffer && raw_buffer->GetFrame() == source) ||
+            (packed_buffer && packed_buffer->GetFrame() == source);
+        if (!backend_matches_buffer || (raw_buffer && !raw_buffer->IsValid())) {
+            last_error_ = "MediaFrame raw buffer and backend frame do not match";
+            return false;
+        }
         av_frame_unref(av_frame);
         const int ret = av_frame_ref(av_frame, source);
         if (ret < 0) {

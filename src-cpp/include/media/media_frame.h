@@ -128,6 +128,9 @@ public:
 
     /// @brief 获取指定平面的 stride
     int32_t Stride(int index) const {
+        if (index < 0 || index >= PlaneCount()) {
+            return 0;
+        }
         if (auto* v = VideoMeta()) return v->plane_info[index].stride;
         if (auto* a = AudioMeta()) return a->planes[index].stride;
         return 0;
@@ -135,6 +138,9 @@ public:
 
     /// @brief 获取指定平面的 offset
     int32_t PlaneOffset(int index) const {
+        if (index < 0 || index >= PlaneCount()) {
+            return 0;
+        }
         if (auto* v = VideoMeta()) return v->plane_info[index].offset;
         if (auto* a = AudioMeta()) return a->planes[index].offset;
         return 0;

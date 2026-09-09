@@ -38,6 +38,6 @@ src-cpp/*.exe
 src-cpp/*.lib
 src-cpp/*.pdb
 build-vs/*
-build-ninja/*
+build-ninja*/*
 .vs/*
 .vscode/*

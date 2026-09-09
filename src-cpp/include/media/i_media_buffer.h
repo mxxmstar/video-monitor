@@ -10,6 +10,9 @@ class IMediaBuffer {
 public:
     virtual ~IMediaBuffer() = default;
 
+    /// @brief 是否描述一段连续的有效字节区，作为 Data()/Size() 的契约。    
+    virtual bool IsContiguous() const { return true; }
+
     /// 返回可读写的数据指针
     virtual uint8_t* Data() = 0;
 

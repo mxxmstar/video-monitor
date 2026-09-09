@@ -538,7 +538,19 @@ bool FFmpegDecoder::receiveFrames() {
         // 转移给 FFmpegRawFrameBuffer；它只持有 AVFrame，不把多平面数据重新
         // 打包为连续内存。后续 converter/encoder 通过 backend.ptr 对它执行
         // av_frame_ref()，因此解码后的像素数据不再发生额外拷贝。
-        auto fb = std::make_shared<FFmpegRawFrameBuffer>(frame);
+
+        // 在 make_shared 完成前仍由局部 RAII 所有者持有 frame，避免对象
+        // 分配或构造抛出异常时泄漏从 avcodec_receive_frame() 得到的资源。
+        const auto frame_deleter = [](AVFrame* owned) {
+            av_frame_free(&owned);
+        };
+        std::unique_ptr<AVFrame, decltype(frame_deleter)> owned_frame(frame, frame_deleter);
+        auto fb = std::make_shared<FFmpegRawFrameBuffer>(owned_frame.get());
+        if (!fb->IsValid()) {
+            LOG_ERROR("decoded AVFrame is not a valid raw media frame");
+            return false;
+        }
+        owned_frame.release();
 
         // frame 的所有权已移交给 fb。为接收下一帧重新分配描述符，避免本次
         // 回调持有的 MediaFrame 与下一次 avcodec_receive_frame() 相互覆盖。
@@ -575,27 +587,12 @@ bool FFmpegDecoder::receiveFrames() {
             // raw AVFrame 的平面地址由 FFmpegRawFrameBuffer::PlaneData() 提供，
             // 所以 plane_info.offset 不再表示连续 buffer 中的偏移，统一设为 0。
             // stride/size 仍记录真实 AVFrame 布局，供只读取元数据的模块使用。
-            ptrdiff_t raw_linesizes[4] = {};
-            size_t raw_plane_sizes[4] = {};
-            if (video_meta.plane_count > 0 && video_meta.plane_count <= 4) {
-                for (int i = 0; i < 4; ++i) {
-                    raw_linesizes[i] = decoded_frame->linesize[i];
-                }
-                (void)av_image_fill_plane_sizes(
-                    raw_plane_sizes,
-                    av_pix_fmt,
-                    video_meta.height,
-                    raw_linesizes);
-            }
-
             // 填充 raw 平面信息。不要依据 offset 对 buffer->Data() 做地址计算；
             // FFmpegRawFrameBuffer 不是连续 buffer，Data() 会返回 nullptr。
             for (int i = 0; i < video_meta.plane_count && i < 8; ++i) {
-                const size_t plane_size = i < 4 ? raw_plane_sizes[i] : 0;
+                const size_t plane_size = fb->PlaneSize(i);
                 video_meta.plane_info[i].offset = 0;
-                video_meta.plane_info[i].stride = i < 4
-                    ? decoded_frame->linesize[i]
-                    : 0;
+                video_meta.plane_info[i].stride = fb->PlaneStride(i);
                 video_meta.plane_info[i].size = plane_size <=
                     static_cast<size_t>(std::numeric_limits<int32_t>::max())
                     ? static_cast<int32_t>(plane_size)

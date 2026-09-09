@@ -6,11 +6,23 @@
 
 #include "media/media_frame.h"
 
+#ifndef CONVERT_STATS_ENABLE
 #define CONVERT_STATS_ENABLE 1
+#endif
 
 struct AVFrame;
 class FFmpegAudioConverter;
 class FFmpegVideoConverter;
+
+/// @brief FFmpeg 音频转换器删除器
+struct FFmpegAudioConverterDeleter {
+    void operator()(FFmpegAudioConverter* converter) const noexcept;
+};
+
+/// @brief FFmpeg 视频转换器删除器
+struct FFmpegVideoConverterDeleter {
+    void operator()(FFmpegVideoConverter* converter) const noexcept;
+};
 
 enum class ConvertBackend {
     FFmpeg,
@@ -159,8 +171,10 @@ private:
     // MediaFrameConverter 负责输入输出适配；具体的 sws/swr 调用由这两个
     // 已有的 FFmpeg converter 完成。使用 unique_ptr 可以在头文件中隐藏
     // FFmpeg converter 的完整定义，降低公共接口对 FFmpeg 实现的暴露。
-    std::unique_ptr<FFmpegVideoConverter> ffmpeg_video_converter_{};
-    std::unique_ptr<FFmpegAudioConverter> ffmpeg_audio_converter_{};
+    std::unique_ptr<FFmpegVideoConverter, FFmpegVideoConverterDeleter>
+        ffmpeg_video_converter_{};
+    std::unique_ptr<FFmpegAudioConverter, FFmpegAudioConverterDeleter>
+        ffmpeg_audio_converter_{};
     bool opened_{false};
 
 #if CONVERT_STATS_ENABLE
