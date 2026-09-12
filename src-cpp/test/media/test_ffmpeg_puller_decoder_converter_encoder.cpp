@@ -2,7 +2,7 @@
 #include "media/decoder/ffmpeg_decoder.h"
 #include "media/converter/media_frame_converter.h"
 #include "media/encoder/ffmpeg_encoder.h"
-#include "media/pusher/ffmpeg_muxer.h"
+#include "media/pusher/ffmpeg_pusher.h"
 #include "media/ffmpeg_raw_frame_buffer.h"
 #include "media/simple_buffer.h"
 #include "common/log/logger.h"
@@ -416,7 +416,7 @@ int RunFfmpegConverterTest() {
     return 0;
 }
 #if 1
-
+static int64_t first_pts_us = -1;
 int RunFfmpegPullerDecoderConverterEncoderTest() {
     auto config = testPullerConfig();     
     auto endpoint = testInputEndpoint();
@@ -499,21 +499,26 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
     uint32_t encode_max_us = 0;
     uint32_t encode_avg_us = 0;
 
-    FFmpegMuxer muxer;
+    FFmpegPusher pusher;
     int64_t muxed_packets = 0;
+    // 解码器回调在当前同步测试中由 Decode() 直接触发。用这个标志把回调
+    // 内部的 Pusher 写入失败反馈给外层测试循环，避免只打印日志却误报通过。
+    bool pusher_write_failed = false;
 
     decoder.SetFrameCallback([&](std::shared_ptr<MediaFrame> frame) {
         if (!frame || frame->type != MediaType::VIDEO) {
             return;
         }
         
+        // 归一化时间戳
+        if (first_pts_us < 0) {
+            first_pts_us = frame->time.pts_us;
+        }
+        frame->time.pts_us -= first_pts_us;
+
         LOG_INFO("Decoded frame {}: {}x{}, pixel_format={}, pts_us={}",
                   decoded_frames, frame->Width(), frame->Height(),
-                  static_cast<int>(frame->PixelFormat()), frame->time.pts_us);
-
-        if (!frame || frame->type != MediaType::VIDEO) {
-            return;
-        }
+                  static_cast<int>(frame->PixelFormat()), frame->time.pts_us);        
 
         
         LOG_INFO("Decoded frame {}: {}x{}, pixel_format={}, pts_us={}",
@@ -556,9 +561,16 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
             LOG_INFO("Encoded packet {}: size={}, pts={}, keyframe={}", encoded_packets,
                       (packet->buffer ? packet->buffer->Size() : 0), packet->pts, packet->keyframe);
             
-            // 写入 muxer
-            if (!muxer.Write(*packet)) {
-                LOG_ERROR("Failed to write packet {} to muxer", encoded_packets);
+            // Pusher 负责检查编码包是否能写入当前输出目标，再转交给 Muxer。
+            // 关键帧等待、重连等写入策略不属于初版 Pusher，后续会由
+            // PusherSession 在调用 Push() 前统一处理。
+            const PusherResult push_result = pusher.Push(*packet);
+            if (!push_result.Succeed()) {
+                pusher_write_failed = true;
+                LOG_ERROR("Failed to push packet {}: {}", encoded_packets,
+                          push_result.error.has_value()
+                              ? push_result.error->message
+                              : "unknown pusher error");
             } else {
                 ++muxed_packets;
             }
@@ -599,7 +611,7 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
         return 1;
     }
 
-    // 构造 MediaTrackConfig 用于 muxer
+    // 构造视频轨道配置。Pusher 会将它交给内部的 FFmpegMuxer 创建输出流。
     MediaTrackConfig muxer_config;
     muxer_config.media_type = encoded_track_info.media_type;
     muxer_config.codec_type = encoded_track_info.codec_type;
@@ -612,17 +624,25 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
     video_track.height = std::get<VideoTrackInfo>(encoded_track_info.specific).height;
     video_track.fps = std::get<VideoTrackInfo>(encoded_track_info.specific).fps;
 
-    // 打开 muxer
+    // 初版 FFmpegPusher 只负责同步输出；输出文件的选择与轨道信息都由
+    // PusherConfig 描述，不能让上层测试直接依赖具体的 FFmpegMuxer。
     const std::string output_file = "test.mp4";
-    if (!muxer.Open(output_file, muxer_config)) {
-        LOG_ERROR("Failed to open muxer for {}", output_file);
+    PusherConfig pusher_config;
+    pusher_config.output_url = output_file;
+    pusher_config.video_track = muxer_config;
+    const PusherResult pusher_open_result = pusher.Open(pusher_config);
+    if (!pusher_open_result.Succeed()) {
+        LOG_ERROR("Failed to open pusher for {}: {}", output_file,
+                  pusher_open_result.error.has_value()
+                      ? pusher_open_result.error->message
+                      : "unknown pusher error");
         converter.Close();
         encoder.Close();
         decoder.Close();
         puller.Close();
         return 1;
     }
-    LOG_INFO("Muxer opened: {}", output_file);
+    LOG_INFO("Pusher opened: {}", output_file);
 
     int packet_count = 0;
     auto start_time = std::chrono::steady_clock::now();
@@ -673,6 +693,14 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
             puller.Close();
             return 1;
         }
+        if (pusher_write_failed) {
+            LOG_ERROR("Pusher write failed while processing video packet {}", packet_count);
+            decoder.Close();
+            encoder.Close();
+            pusher.Close();
+            puller.Close();
+            return 1;
+        }
         auto decode_end_time = Now();
         auto decode_duration_us = decode_end_time - decode_start_time;
         decode_total_us += decode_duration_us;
@@ -710,24 +738,39 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
         LOG_INFO("Flush packet {}: size={}, pts={}, keyframe={}", encoded_packets,
                  packet->buffer ? packet->buffer->Size() : 0, packet->pts, packet->keyframe);
         
-        // 写入 muxer
-        if (!muxer.Write(*packet)) {
-            LOG_ERROR("Failed to write flush packet {} to muxer", encoded_packets);
+        // Flush 期间产生的尾部编码包也必须经过同一个 Pusher，保证正常包和
+        // 编码器缓存包遵循同一份输出校验与时间基转换路径。
+        const PusherResult push_result = pusher.Push(*packet);
+        if (!push_result.Succeed()) {
+            pusher_write_failed = true;
+            LOG_ERROR("Failed to push flush packet {}: {}", encoded_packets,
+                      push_result.error.has_value()
+                          ? push_result.error->message
+                          : "unknown pusher error");
         } else {
             ++muxed_packets;
         }
     }
 
+    if (pusher_write_failed) {
+        LOG_ERROR("Pusher write failed while flushing encoder packets");
+        decoder.Close();
+        encoder.Close();
+        pusher.Close();
+        puller.Close();
+        return 1;
+    }
+
     // 先 Flush 再 Close：Close 只释放 AVCodecContext，不会主动输出缓存帧。
     decoder.Close();
     encoder.Close();
-    muxer.Close();
+    pusher.Close();
     puller.Close();
 
     // 成功结果只表达测试真正验证的条件：已经解码出目标数量的视频帧。
     // video_packet_count 是过程诊断数据，不能作为“10 帧必须来自 10 包”
     // 的断言依据。
-    LOG_INFO("FFmpegPuller -> FFmpegDecoder -> MediaFrameConverter -> FFmpegEncoder -> FFmpegMuxer test passed");
+    LOG_INFO("FFmpegPuller -> FFmpegDecoder -> MediaFrameConverter -> FFmpegEncoder -> FFmpegPusher test passed");
     LOG_INFO("Muxed packets: {}", muxed_packets);
     LOG_INFO("=======================");
     decoder.PrintStats();

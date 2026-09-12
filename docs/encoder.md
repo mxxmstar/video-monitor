@@ -199,6 +199,57 @@ MediaFrame.time.pts_us -> AVFrame.pts（直接赋值）
 int64_t resolveFramePts(const MediaFrame& frame);
 ```
 
+### 7.1 已知问题：编码输出时间戳非单调递增导致 muxer 失败
+
+**现象**：在 `test_ffmpeg_puller_decoder_converter_encoder` 中，编码若干帧后 muxer 报错并停止写出：
+
+```text
+[mp4] Application provided invalid, non monotonically increasing dts to muxer in stream 0: 1024 >= 1024
+[ffmpeg_muxer.cpp] av_interleaved_write_frame failed: Invalid argument
+```
+
+**根因**：`resolveFramePts()` 本应保证输出时间戳严格递增，但旧实现返回的是 `av_rescale_q` 取整后的原始 `pts`，而不是被 `next_pts_` 计数器修正后的值：
+
+```cpp
+// 旧实现（有 bug）
+if (IsValidTimestamp(frame.time.pts_us)) {
+    const int64_t pts = av_rescale_q(frame.time.pts_us, kMicrosecondTimeBase,
+        codec_ctx_->time_base);
+    next_pts_ = std::max(next_pts_, pts + 1);
+    return pts;   // 错误地返回了会碰撞的原始值，next_pts_ 成了死代码
+}
+return next_pts_++;
+```
+
+当编码器 `time_base` 为帧率制（如 `1/25`）时，间隔较近的输入帧微秒时间戳会在取整后碰撞。例如解码器输出 `pts_us = 0, 66045, 99200`：
+
+- `66045 * 25 / 1e6 ≈ 1.65 → 2`
+- `99200 * 25 / 1e6 ≈ 2.48 → 2`
+
+第 2、3 帧都得到 `pts=2`。由于 `max_b_frames=0` 时 `dts == pts`，两个包的 `dts` 也都为 `2`。muxer 将其重标定到 MP4 流时间基（`1/12800`，乘子 512）后得到 `1024`，两个包相同 → muxer 判定 DTS 非单调而报错。
+
+**修复**：`resolveFramePts()` 真正返回单调递增的值——源时间戳有效且领先于已分配计数器则采用它，否则用 `next_pts_` 兜底递增：
+
+```cpp
+int64_t FFmpegEncoder::resolveFramePts(const MediaFrame& frame) {
+    int64_t raw_pts = kNoTimestamp;
+    if (IsValidTimestamp(frame.time.pts_us)) {
+        raw_pts = av_rescale_q(frame.time.pts_us, kMicrosecondTimeBase,
+            codec_ctx_ ? codec_ctx_->time_base : AVRational{1, 1'000'000});
+    }
+    int64_t pts = raw_pts;
+    if (!IsValidTimestamp(pts) || pts < next_pts_) {
+        pts = next_pts_;
+    }
+    next_pts_ = pts + 1;
+    return pts;
+}
+```
+
+修复后上述样例输出时间戳变为 `0, 2, 3` → 重标定后 `0, 1024, 1536`，严格递增，muxer 可正常写完。
+
+**注意**：该修复保证编码器层 PTS/DTS 单调递增；若未来引入 B 帧（`max_b_frames > 0`），需额外确认 DTS/PTS 重排后 muxer 仍能接受（编码器通常也会自行保证 DTS 单调）。
+
 ## 8. 编码器选择
 
 `FFmpegEncoder` 会根据 `codec_type` 和输入格式自动选择合适的编码器：

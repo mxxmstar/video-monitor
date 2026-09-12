@@ -701,16 +701,23 @@ const AVCodec* FFmpegEncoder::findAudioEncoder(AVCodecID codec_id, AVSampleForma
 
 
 int64_t FFmpegEncoder::resolveFramePts(const MediaFrame& frame) {
+    int64_t raw_pts = kNoTimestamp;
     if (IsValidTimestamp(frame.time.pts_us)) {
         // MediaFrame 明确使用微秒，送入 FFmpeg 前必须换算到编码器 time_base。
-        const int64_t pts = av_rescale_q(frame.time.pts_us, kMicrosecondTimeBase,
-            codec_ctx_ ? codec_ctx_->time_base : AVRational{1, 1'000'000});        
-        // 递增 pts 计数器
-        next_pts_ = std::max(next_pts_, pts + 1);
-        return pts;
+        raw_pts = av_rescale_q(frame.time.pts_us, kMicrosecondTimeBase,
+            codec_ctx_ ? codec_ctx_->time_base : AVRational{1, 1'000'000});
     }
-    // 未指定 pts，递增分配
-    return next_pts_++;
+
+    // 必须保证输出时间戳严格递增。否则当相邻输入帧在编码器 time_base 下取整
+    // 后碰撞（例如 66045us 与 99200us 在 1/25 下都取整为 2），编码出的两个包
+    // 会带有相同的 pts/dts，导致 muxer 报 "non monotonically increasing dts"。
+    // 若源时间戳有效且领先于已分配计数器则采用它，否则用计数器兜底递增。
+    int64_t pts = raw_pts;
+    if (!IsValidTimestamp(pts) || pts < next_pts_) {
+        pts = next_pts_;
+    }
+    next_pts_ = pts + 1;
+    return pts;
 }
 
 #if ENCODE_STATS_ENABLE    

@@ -1,6 +1,6 @@
 #include "media/converter/media_frame_converter.h"
 #include "media/encoder/ffmpeg_encoder.h"
-#include "media/pusher/ffmpeg_muxer.h"
+#include "media/pusher/ffmpeg_pusher.h"
 #include "media/simple_buffer.h"
 
 #include <algorithm>
@@ -154,18 +154,36 @@ int main() {
     std::error_code remove_error;
     std::filesystem::remove(output_path, remove_error);
 
-    FFmpegMuxer muxer;
-    if (!muxer.Open(output_path.string(), MakeMuxerConfig(encoder.GetOutputInfo()))) {
-        std::cerr << "Failed to open timestamp test muxer" << std::endl;
+    // 使用真实编码包经过 Pusher 写入。这样时间戳回归测试同时验证：
+    // Pusher 的包校验没有改变编码器输出，Muxer 仍会将本地 MP4 的起始
+    // 时间戳归零，以及 Close() 会写出可重新读取的容器尾部。
+    PusherConfig pusher_config;
+    pusher_config.output_url = output_path.string();
+    pusher_config.video_track = MakeMuxerConfig(encoder.GetOutputInfo());
+
+    FFmpegPusher pusher;
+    const PusherResult open_result = pusher.Open(pusher_config);
+    if (!open_result.Succeed()) {
+        std::cerr << "Failed to open timestamp test pusher: "
+                  << (open_result.error.has_value()
+                          ? open_result.error->message
+                          : "unknown pusher error")
+                  << std::endl;
         return 1;
     }
     for (const auto& packet : packets) {
-        if (!muxer.Write(*packet)) {
-            std::cerr << "Failed to mux timestamp test packet" << std::endl;
+        const PusherResult push_result = pusher.Push(*packet);
+        if (!push_result.Succeed()) {
+            std::cerr << "Failed to push timestamp test packet: "
+                      << (push_result.error.has_value()
+                              ? push_result.error->message
+                              : "unknown pusher error")
+                      << std::endl;
+            pusher.Close();
             return 1;
         }
     }
-    muxer.Close();
+    pusher.Close();
 
     const bool normalized = VerifyLocalFileTimeline(output_path);
     std::filesystem::remove(output_path, remove_error);

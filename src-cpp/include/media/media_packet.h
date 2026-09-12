@@ -83,7 +83,7 @@ public:
 
     bool       keyframe{false};                   ///< 是否为关键帧
     std::shared_ptr<IMediaBuffer> buffer;          ///< 编码数据载荷
-    BackendHandle backend;                         ///< 后端引擎句柄
+    BackendHandle backend;                         ///< 所有权
 
     void Dump() const {
         LOG_INFO("MediaPacket: type={}, codec={}, stream_index={}, pts={}, dts={}, duration={}, time_base={}, keyframe={}, buffer_size={}",
