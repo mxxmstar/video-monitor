@@ -4,6 +4,11 @@
 
 当前工程已经完成了 `FFmpegPuller -> FFmpegDecoder -> MediaFrameConverter -> FFmpegEncoder -> FFmpegMuxer` 的基本实验链路。
 
+当前正在实现的是原工程的 `PushClient` 路线：程序主动连接一个输出目标，
+将已经编码好的媒体包交给 FFmpeg 封装并发送。这个路线中的协议差异，优先由
+FFmpeg 的输出 URL、format 和协议选项解决；不需要为 RTMP、RTSP Client、SRT
+或 MPEG-TS 等协议分别创建一个 Pusher。
+
 后续不直接照搬原工程 `Publisher -> ProtocolAdapter -> Protocol -> MuxerCore` 的职责划分，而是建立一套更容易理解和维护的输出结构：
 
 ```text
@@ -16,7 +21,9 @@ Muxer -> Pusher -> PusherSession -> Publisher
 编码视频包 -> PusherSession -> FFmpegPusher -> FFmpegMuxer -> MP4 文件
 ```
 
-完成这条链路后，再增加 RTSP Server 发布路线。
+完成这条链路后，可以先通过修改 FFmpeg 输出配置验证网络 PushClient；
+再单独增加 RTSP Server/PullServer 路线。后者是监听端口并向客户端分发媒体，
+职责与 PushClient 不同。
 
 ## 2. 四层职责
 
@@ -43,17 +50,43 @@ Muxer 不负责：
 
 当前阶段的 `FFmpegMuxer` 只实现单路 H.264 视频，先不扩展音频和多轨。
 
-### 2.2 Pusher：输出协议适配层
+### 2.2 Pusher：FFmpeg 输出适配层
 
 代表类：`FFmpegPusher`
 
-Pusher 持有一个具体的 Muxer，并把某种输出方式适配到 Muxer：
+在当前 PushClient 路线中，Pusher 持有 FFmpeg Muxer，并把统一的
+`MediaPacket` 输出接口适配到 FFmpeg：
 
 - 接收 `MediaPacket`；
 - 校验 packet 是否符合当前输出配置；
 - 调用 `FFmpegMuxer::Open/Write/Close`；
 - 将底层错误转换为 Pusher 层结果；
 - 保存当前输出目标和基本统计。
+
+`FFmpegPusher` 不是某一种协议的实现类。只要目标协议和目标封装格式由
+FFmpeg 支持，就继续使用同一个 `FFmpegPusher -> FFmpegMuxer`：
+
+```text
+output_url = "output.mp4"              -> FFmpeg muxer -> MP4
+output_url = "rtmp://host/live/stream" -> FFmpeg muxer -> FLV/RTMP
+output_url = "rtsp://host/live/stream" -> FFmpeg muxer -> RTSP Client
+output_url = "srt://host:port"          -> FFmpeg muxer -> SRT
+```
+
+因此，新增一种 FFmpeg 已支持的 PushClient 协议时，优先扩展配置，而不是
+增加 `RtmpPusher`、`RtspPusher` 或 `SrtPusher`。未来配置可以逐步补充：
+
+```cpp
+struct FFmpegOutputConfig {
+    std::string output_url;  // 由 URL 推断协议和默认封装格式
+    std::string format_name; // 可选，例如 flv、rtsp、mpegts
+    std::map<std::string, std::string> options;
+};
+```
+
+`FFmpegPusher` 仍然只负责生命周期、packet 校验和错误转换；
+`FFmpegMuxer` 负责把 format、协议参数和时间基传给 FFmpeg。Publisher 和
+PusherSession 不应根据 `rtmp`、`rtsp` 等字符串编写协议分支。
 
 第一版 `FFmpegPusher` 只做同步转发，不实现：
 
@@ -111,10 +144,62 @@ Publisher 不实现 FFmpeg 封装细节，也不实现 RTSP 控制协议细节�
 | `FfmpegMuxProtocol` | `FFmpegPusher` + `PusherSession` 的拆分职责 | 原工程同时包含协议、重连和关键帧策略 |
 | `FfmpegMuxerCore` | `FFmpegMuxer` | FFmpeg stream、时间基和写包 |
 | `PublisherSinkNode` | `PusherSession` 的部分职责 | 原工程还混合了 MediaFlow 节点、队列和多轨逻辑 |
-| `RtspServerProtocol` | 后续 `RtspServerPusher` | RTSP Server 输出实现 |
-| `RtspClientSession` | RTSP Server Pusher 内部对象 | 它是客户端连接 Session，不是通用 PusherSession |
+| `RtspServerProtocol` | 后续 PullServer 的 Protocol 层 | 监听、建轨、RTP/RTCP 和客户端分发 |
+| `RtspClientSession` | 后续 PullServer 内部对象 | 管理单个播放客户端，不是通用 PusherSession |
 
 原工程中没有 `pusher` 目录，是因为它把“输出协议适配”和“发布会话策略”主要放进了 `Protocol`、`ProtocolAdapter` 和 `PublisherSinkNode`。本版本主动拆开这些职责，目的是学习和维护，而不是保持原工程的类名一致。
+
+### 3.1 PushClient 与 PullServer 的边界
+
+两条路线虽然都属于媒体输出，但工作模型不同：
+
+```text
+PushClient：主动连接一个目标
+编码包 -> PusherSession -> FFmpegPusher -> FFmpegMuxer -> 远端服务
+
+PullServer：监听并服务多个客户端
+编码包 -> 发布轨道/Server -> Protocol -> RtspClientSession(s) -> RTP/RTCP 客户端
+```
+
+PushClient 主要需要解决：
+
+- FFmpeg 输出格式和 URL；
+- 编码包到输出流的映射；
+- 时间基转换；
+- 连接失败和会话重连。
+
+PullServer 还需要解决：
+
+- 监听端口和接受连接；
+- OPTIONS、DESCRIBE、SETUP、PLAY、TEARDOWN；
+- 多个客户端共享同一媒体轨道；
+- RTP 打包、RTCP 和传输模式；
+- 慢客户端、客户端断开和鉴权。
+
+所以，原工程的 `Protocol` 主要在 PullServer 路线中变得必要。不能因为
+两条路线都使用 RTSP，就把 RTSP Server 的客户端控制和 RTP 逻辑塞进
+`FFmpegPusher`。
+
+### 3.2 新增输出能力时的判断规则
+
+按下面的顺序决定扩展位置：
+
+| 变化 | 扩展位置 |
+|---|---|
+| 只是更换 FFmpeg 支持的 URL 协议或封装格式 | `PusherConfig`、`FFmpegOutputConfig`、`FFmpegMuxer` |
+| FFmpeg 支持该协议，但需要专用连接参数 | FFmpeg 输出 options，不新增 Pusher 子类 |
+| 不再通过 FFmpeg 写出，使用独立网络库发送单个目标 | 新增 `IPusher` 实现 |
+| 需要监听端口、管理多个客户端和 RTP/RTCP | 新增 PullServer/Protocol/ClientSession 路线 |
+| 同时发布到多个目标 | 后续新增 `MultiPublisher` 或统一多目标编排层 |
+| 主备切换或统一健康检查 | 后续新增 Publisher 装饰器或管理层 |
+
+核心原则是：
+
+```text
+FFmpeg 可以完成的 PushClient 协议 -> 配置扩展
+输出策略发生变化 -> Publisher/PusherSession 扩展
+服务端协议和多客户端模型 -> Protocol/ServerSession 扩展
+```
 
 ## 4. 推进阶段
 
@@ -271,7 +356,13 @@ Publisher 负责：
 PublisherKind::FFmpegFile
 ```
 
-不要在这一阶段加入 RTSP Server、WebRTC 或 RTP UDP。
+当前枚举名 `FFmpegFile` 只是第一版以 MP4 文件为目标的历史命名。等
+FFmpegPusher 验证网络输出后，如果同一个实现需要同时表示文件和网络目标，
+可以将其改名为更准确的 `FFmpegOutput`；这只是配置命名调整，不意味着要
+增加多个协议 Pusher。
+
+不要在这一阶段加入 RTSP Server、WebRTC 或 RTP UDP。RTSP Server 属于后续
+PullServer 路线，不是当前 FFmpeg PushClient 的下一种 URL 配置。
 
 ### 阶段 5：补充输出重连
 
@@ -334,31 +425,35 @@ RTSP
 
 RTSP 测试不能替代离线测试，因为网络流的首个时间戳、帧率和连接状态不是确定的。
 
-## 5. 后续 RTSP Server 路线
+## 5. 后续 PullServer / RTSP Server 路线
 
-RTSP Server 是发布端的另一种 Pusher，不应把 RTSP Server 的客户端控制逻辑塞进 `FFmpegPusher`。
+RTSP Server 不是当前 PushClient 的另一个 FFmpeg URL。它是 PullServer 路线：
+程序监听端口，接受客户端请求，再把编码媒体分发给一个或多个客户端。
+因此不能把 RTSP Server 的客户端控制逻辑塞进 `FFmpegPusher`。
 
 后续结构建议为：
 
 ```text
-Publisher
-    -> PusherSession
-        -> RtspServerPusher
-            -> RtspServer
-                -> RtspClientSession(s)
-                    -> RTP/RTCP transport
+PullServer / Publisher Server
+    -> RtspServer
+        -> RtspProtocol
+            -> RtspClientSession(s)
+                -> RTP/RTCP transport
 ```
 
 这里有两种不同含义的 Session：
 
-- `PusherSession`：面向媒体生产者，管理一次发布任务；
+- `PusherSession`：面向 PushClient 的媒体生产者，管理一次主动输出任务；
 - `RtspClientSession`：面向单个 RTSP 播放客户端，管理 OPTIONS、DESCRIBE、SETUP、PLAY、TEARDOWN 和 RTP/RTCP。
 
-`RtspServerPusher` 负责把编码包交给 RTSP Server，并维护发布轨道；`RtspClientSession` 负责把已经发布的媒体分发给客户端。两者不能混成一个通用 Session。
+如果后续仍希望由统一的应用层 `Publisher` 暴露入口，可以在 Publisher
+下面增加 PullServer 类型；但它内部应使用独立的 Server/Protocol/ClientSession
+组件，而不是复用 `FFmpegPusher` 来实现监听和多客户端分发。两者不能混成
+一个通用 Session。
 
 RTSP Server 路线的实现顺序：
 
-1. 先实现单路 H.264、单客户端、TCP interleaved；
+1. 先实现独立于 FFmpegPusher 的单路 H.264、单客户端、TCP interleaved；
 2. 再支持多个客户端共享同一发布轨道；
 3. 再加入 UDP RTP/RTCP；
 4. 再加入鉴权、慢客户端隔离和连接数限制；
