@@ -19,6 +19,7 @@ enum class PusherErrorCategory {
     InvalidPacket,         ///< packet 的元数据、载荷或后端句柄无效
     OpenFailed,            ///< 底层输出容器打开失败
     WriteFailed,           ///< 底层输出容器写包失败
+    Internal,              ///< Pusher 实现或会话依赖未正确初始化
 };
 
 /// @brief Pusher 对外暴露的结构化错误。
