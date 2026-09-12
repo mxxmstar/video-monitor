@@ -2,7 +2,7 @@
 #include "media/decoder/ffmpeg_decoder.h"
 #include "media/converter/media_frame_converter.h"
 #include "media/encoder/ffmpeg_encoder.h"
-#include "media/pusher/pusher_session.h"
+#include "media/publisher/publisher.h"
 #include "media/ffmpeg_raw_frame_buffer.h"
 #include "media/simple_buffer.h"
 #include "common/log/logger.h"
@@ -498,11 +498,11 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
     uint32_t encode_max_us = 0;
     uint32_t encode_avg_us = 0;
 
-    PusherSession pusher_session;
+    Publisher publisher;
     int64_t muxed_packets = 0;
     // 解码器回调在当前同步测试中由 Decode() 直接触发。用这个标志把回调
-    // 内部的 Pusher 写入失败反馈给外层测试循环，避免只打印日志却误报通过。
-    bool pusher_write_failed = false;
+    // 内部的 Publisher 写入失败反馈给外层测试循环，避免只打印日志却误报通过。
+    bool publisher_write_failed = false;
 
     decoder.SetFrameCallback([&](std::shared_ptr<MediaFrame> frame) {
         if (!frame || frame->type != MediaType::VIDEO) {
@@ -554,13 +554,11 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
             LOG_INFO("Encoded packet {}: size={}, pts={}, keyframe={}", encoded_packets,
                       (packet->buffer ? packet->buffer->Size() : 0), packet->pts, packet->keyframe);
             
-            // Session 决定当前 packet 是否允许写入： Publish 只接受首个
-            // 关键帧作为起点；满足策略的包才会交给内部 FFmpegPusher。
-            const PusherPublishResult publish_result = pusher_session.Publish(*packet);
+            const PusherPublishResult publish_result = publisher.Publish(*packet);
             if (!publish_result.Succeed()) {
-                pusher_write_failed = true;
+                publisher_write_failed = true;
                 LOG_ERROR("Failed to push packet {}: {}", encoded_packets, publish_result.error.has_value()
-                              ? publish_result.error->message : "unknown pusher error");
+                              ? publish_result.error->message : "unknown publisher error");
             } else if (publish_result.WasPublished()) {
                 ++muxed_packets;
             }
@@ -617,21 +615,22 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
     // Session 先打开内部 Pusher，再进入 WaitingForKeyframe。这样后续即使
     // Pusher 发生替换，调用方也不需要了解 FFmpegMuxer 的具体细节。
     const std::string output_file = "test.mp4";
-    PusherSessionConfig session_config;
-    session_config.pusher.output_url = output_file;
-    session_config.pusher.video_track = muxer_config;
-    const PusherResult session_open_result = pusher_session.Open(session_config);
+    PublisherConfig publisher_config;
+    publisher_config.kind = PublisherKind::FFmpegFile;
+    publisher_config.session.pusher.output_url = output_file;
+    publisher_config.session.pusher.video_track = muxer_config;
+    const PusherResult session_open_result = publisher.Open(publisher_config);
     if (!session_open_result.Succeed()) {
-        LOG_ERROR("Failed to open pusher session for {}: {}", output_file,
+        LOG_ERROR("Failed to open publisher for {}: {}", output_file,
                   session_open_result.error.has_value()
-                      ? session_open_result.error->message : "unknown pusher error");
+                      ? session_open_result.error->message : "unknown publisher error");
         converter.Close();
         encoder.Close();
         decoder.Close();
         puller.Close();
         return 1;
     }
-    LOG_INFO("PusherSession opened: {}", output_file);
+    LOG_INFO("Publisher opened: {}", output_file);
 
     int packet_count = 0;
     auto start_time = std::chrono::steady_clock::now();
@@ -682,11 +681,11 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
             puller.Close();
             return 1;
         }
-        if (pusher_write_failed) {
-            LOG_ERROR("Pusher write failed while processing video packet {}", packet_count);
+        if (publisher_write_failed) {
+            LOG_ERROR("Publisher write failed while processing video packet {}", packet_count);
             decoder.Close();
             encoder.Close();
-            pusher_session.Close();
+            publisher.Close();
             puller.Close();
             return 1;
         }
@@ -730,23 +729,23 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
         // Flush 期间产生的尾部编码包也必须经过同一个 Session，保证正常包和
         // 编码器缓存包遵循同一份关键帧策略与输出校验路径。
         const PusherPublishResult publish_result =
-            pusher_session.Publish(*packet);
+            publisher.Publish(*packet);
         if (!publish_result.Succeed()) {
-            pusher_write_failed = true;
+            publisher_write_failed = true;
             LOG_ERROR("Failed to push flush packet {}: {}", encoded_packets,
                       publish_result.error.has_value()
                           ? publish_result.error->message
-                          : "unknown pusher error");
+                          : "unknown publisher error");
         } else if (publish_result.WasPublished()) {
             ++muxed_packets;
         }
     }
 
-    if (pusher_write_failed) {
-        LOG_ERROR("Pusher write failed while flushing encoder packets");
+    if (publisher_write_failed) {
+        LOG_ERROR("Publisher write failed while flushing encoder packets");
         decoder.Close();
         encoder.Close();
-        pusher_session.Close();
+        publisher.Close();
         puller.Close();
         return 1;
     }
@@ -754,7 +753,7 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
     // 先 Flush 再 Close：Close 只释放 AVCodecContext，不会主动输出缓存帧。
     decoder.Close();
     encoder.Close();
-    pusher_session.Close();
+    publisher.Close();
     puller.Close();
 
     // 成功结果只表达测试真正验证的条件：已经解码出目标数量的视频帧。

@@ -63,7 +63,7 @@ inline constexpr bool IsValidTimestamp(std::int64_t timestamp) {
 }
 
 /// @brief 判断时间基是否可以用于整数时间戳换算。
-inline constexpr bool IsValidTimeBase(const Rational& value) {
+inline constexpr bool IsValidTimeBase(const Rational& value) {    
     return value.num > 0 && value.den > 0;
 }
 

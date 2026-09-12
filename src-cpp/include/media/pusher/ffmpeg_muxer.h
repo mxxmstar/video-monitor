@@ -1,7 +1,7 @@
 #pragma once
 #include <string>
 #include "media/stream/stream_info.h"
-#include "media/publisher/publisher_config.h"
+#include "media/pusher/pusher_config.h"
 #include "media/media_packet.h"
 
 extern "C" {

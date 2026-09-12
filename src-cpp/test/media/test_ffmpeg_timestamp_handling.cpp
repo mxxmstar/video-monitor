@@ -1,6 +1,6 @@
 #include "media/converter/media_frame_converter.h"
 #include "media/encoder/ffmpeg_encoder.h"
-#include "media/pusher/pusher_session.h"
+#include "media/publisher/publisher.h"
 #include "media/simple_buffer.h"
 
 #include <algorithm>
@@ -154,17 +154,20 @@ int main() {
     std::error_code remove_error;
     std::filesystem::remove(output_path, remove_error);
 
-    // 使用真实编码包经过 Session 写入。该测试同时验证：首个编码关键帧能
-    // 启动会话、Session 会转发后续包、Muxer 仍会将本地 MP4 的起始时间戳
-    // 归零，以及 Close() 会写出可重新读取的容器尾部。
-    PusherSessionConfig session_config;
-    session_config.pusher.output_url = output_path.string();
-    session_config.pusher.video_track = MakeMuxerConfig(encoder.GetOutputInfo());
+    // 使用真实编码包经过 Publisher 写入。实际链路为：
+    // Publisher -> PusherSession -> FFmpegPusher -> FFmpegMuxer。
+    // 该测试同时验证首个关键帧能启动会话、Publisher 会转发后续包、Muxer
+    // 仍会将本地 MP4 的起始时间戳归零，以及 Close() 会写出可读取的尾部。
+    PublisherConfig publisher_config;
+    publisher_config.kind = PublisherKind::FFmpegFile;
+    publisher_config.session.pusher.output_url = output_path.string();
+    publisher_config.session.pusher.video_track =
+        MakeMuxerConfig(encoder.GetOutputInfo());
 
-    PusherSession session;
-    const PusherResult open_result = session.Open(session_config);
+    Publisher publisher;
+    const PusherResult open_result = publisher.Open(publisher_config);
     if (!open_result.Succeed()) {
-        std::cerr << "Failed to open timestamp test session: "
+        std::cerr << "Failed to open timestamp test publisher: "
                   << (open_result.error.has_value()
                           ? open_result.error->message
                           : "unknown pusher error")
@@ -172,18 +175,18 @@ int main() {
         return 1;
     }
     for (const auto& packet : packets) {
-        const PusherPublishResult publish_result = session.Publish(*packet);
+        const PusherPublishResult publish_result = publisher.Publish(*packet);
         if (!publish_result.Succeed()) {
             std::cerr << "Failed to publish timestamp test packet: "
                       << (publish_result.error.has_value()
                               ? publish_result.error->message
                               : "unknown pusher error")
                       << std::endl;
-            session.Close();
+            publisher.Close();
             return 1;
         }
     }
-    session.Close();
+    publisher.Close();
 
     const bool normalized = VerifyLocalFileTimeline(output_path);
     std::filesystem::remove(output_path, remove_error);
