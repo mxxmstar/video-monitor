@@ -2,7 +2,6 @@
 
 #include <variant>
 
-#include "media/publisher/publisher_config.h"
 #include "common/log/logger.h"
 
 bool MediaTrackConfig::is_video() const {

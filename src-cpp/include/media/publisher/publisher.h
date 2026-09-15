@@ -2,28 +2,7 @@
 
 #include <memory>
 
-#include "media/pusher/pusher_session.h"
-
-/// @brief 发布目标类型。
-///
-/// 初版只注册 FFmpeg 文件输出。
-enum class PublisherKind {
-    FFmpegFile,
-};
-
-/// @brief 对上层暴露的一次发布任务配置。
-///
-/// PublisherConfig 比 PusherSessionConfig 多出“要创建哪类输出会话”的选择。
-/// 当前只有 FFmpegFile，因此它只是一个显式的边界；不能让上层直接依赖
-/// FFmpegPusher 或 FFmpegMuxer，后续扩展输出类型时也不用修改调用方式。
-struct PublisherConfig {
-    PublisherKind kind{PublisherKind::FFmpegFile};
-    PusherSessionConfig session;
-
-    bool is_valid() const {
-        return kind == PublisherKind::FFmpegFile && session.is_valid();
-    }
-};
+#include "media/publisher/publisher_config.h"
 
 /// @brief Publisher 的对外状态。
 ///
