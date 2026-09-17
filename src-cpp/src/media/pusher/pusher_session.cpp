@@ -91,8 +91,10 @@ PusherPublishResult PusherSession::forwardAcceptedPacket(const MediaPacket& pack
     const PusherResult push_result = pusher_->Push(packet);
     if (!push_result.Succeed()) {
         // InvalidPacket 等调用方输入错误不会破坏已经打开的输出容器，等待
-        // 下一包仍然合理；真正的底层 WriteFailed 才表示当前输出会话失效。
-        if (push_result.error.has_value() && push_result.error->category == PusherErrorCategory::WriteFailed) {
+        // 下一包仍然合理；底层超时、网络、取消等错误均使当前会话失效。
+        if (push_result.error.has_value() &&
+            push_result.error->category != PusherErrorCategory::InvalidPacket &&
+            push_result.error->category != PusherErrorCategory::UnsupportedMedia) {
             state_ = PusherSessionState::Failed;
         }
 

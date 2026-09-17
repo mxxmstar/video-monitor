@@ -63,6 +63,11 @@ public:
                 PusherErrorCategory::WriteFailed,
                 "scripted write failed"));
         }
+        if (next_error) {
+            auto error = std::move(*next_error);
+            next_error.reset();
+            return PusherResult::Failed(std::move(error));
+        }
         return PusherResult::Success();
     }
 
@@ -80,6 +85,7 @@ public:
     bool opened{false};
     bool fail_next_push{false};
     bool last_packet_was_keyframe{false};
+    std::optional<PusherError> next_error;
 };
 
 bool IsFailedWith(const PusherPublishResult& result,
@@ -171,6 +177,71 @@ int main() {
         failing_session.State() != PusherSessionState::Closed) {
         std::cerr << "Failed session did not close cleanly" << std::endl;
         return 1;
+    }
+
+    // 错误分类测试
+    std::vector<std::string> retryable_errors;
+    std::vector<std::string> non_retryable_errors;
+
+    for (const auto category : {PusherErrorCategory::Timeout, PusherErrorCategory::Network,
+                               PusherErrorCategory::Cancelled, PusherErrorCategory::Internal,
+                               PusherErrorCategory::InvalidPacket}) {
+        if (!failing_session.Open(config).Succeed()) return 1;
+        const bool retryable = category == PusherErrorCategory::Timeout ||
+                               category == PusherErrorCategory::Network;
+        failing->next_error = PusherError{category, "scripted error", retryable};
+        const auto result = failing_session.Publish(MakeVideoPacket(true));
+        const auto expected_state = category == PusherErrorCategory::InvalidPacket
+            ? PusherSessionState::WaitingForKeyframe : PusherSessionState::Failed;
+        
+        // 打印错误结果
+        std::string category_str;
+        switch (category) {
+            case PusherErrorCategory::Timeout: category_str = "Timeout"; break;
+            case PusherErrorCategory::Network: category_str = "Network"; break;
+            case PusherErrorCategory::Cancelled: category_str = "Cancelled"; break;
+            case PusherErrorCategory::Internal: category_str = "Internal"; break;
+            case PusherErrorCategory::InvalidPacket: category_str = "InvalidPacket"; break;
+            default: category_str = "Unknown"; break;
+        }
+        
+        std::string state_str;
+        switch (failing_session.State()) {
+            case PusherSessionState::WaitingForKeyframe: state_str = "WaitingForKeyframe"; break;
+            case PusherSessionState::Failed: state_str = "Failed"; break;
+            case PusherSessionState::Closed: state_str = "Closed"; break;
+            case PusherSessionState::Running: state_str = "Running"; break;
+            default: state_str = "Unknown"; break;
+        }
+
+        std::string error_detail = category_str + " -> " + state_str + " (retryable: " + (retryable ? "yes" : "no") + ")";
+        
+        if (!IsFailedWith(result, category) || result.error->retryable != retryable ||
+            failing_session.State() != expected_state) {
+            std::cerr << "FAILED: " << error_detail << " - Session lost error policy or state" << std::endl;
+            return 1;
+        }
+        
+        std::cout << "PASSED: " << error_detail << std::endl;
+        
+        if (retryable) {
+            retryable_errors.push_back(error_detail);
+        } else {
+            non_retryable_errors.push_back(error_detail);
+        }
+        
+        if (!failing_session.Close().Succeed()) return 1;
+    }
+
+    // 打印汇总
+    std::cout << "\n=== Error Policy Summary ===" << std::endl;
+    std::cout << "Retryable Errors (" << retryable_errors.size() << "):" << std::endl;
+    for (const auto& err : retryable_errors) {
+        std::cout << "  - " << err << std::endl;
+    }
+    std::cout << "Non-Retryable Errors (" << non_retryable_errors.size() << "):" << std::endl;
+    for (const auto& err : non_retryable_errors) {
+        std::cout << "  - " << err << std::endl;
     }
 
     std::cout << "PusherSession test passed" << std::endl;

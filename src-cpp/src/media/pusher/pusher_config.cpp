@@ -1,6 +1,8 @@
 #include "media/pusher/pusher_config.h"
 
 #include <variant>
+#include <cmath>
+#include <limits>
 
 #include "common/log/logger.h"
 
@@ -37,6 +39,10 @@ const VideoTrackConfig& MediaTrackConfig::video() const {
 }
 
 bool MediaTrackConfig::is_valid() const {
+    if ((is_audio() && !std::holds_alternative<AudioTrackConfig>(track_config)) ||
+        (is_video() && !std::holds_alternative<VideoTrackConfig>(track_config))) {
+        return false;
+    }
     if (media_type == MediaType::AUDIO) {
         if (audio().sample_rate <= 0 || audio().channels <= 0) {
             LOG_ERROR("Invalid audio config: sample_rate or channels is <= 0");
@@ -47,7 +53,7 @@ bool MediaTrackConfig::is_valid() const {
             LOG_ERROR("Invalid video config: width or height is <= 0");
             return false;
         }
-        if (video().fps <= 0) {
+        if (!std::isfinite(video().fps) || video().fps <= 0) {
             LOG_ERROR("Invalid video config: fps is <= 0");
             return false;
         }
@@ -59,6 +65,10 @@ bool MediaTrackConfig::is_valid() const {
 }
 
 bool PusherConfig::is_valid() const {
+    if (io.connect_timeout.count() < 0 || io.write_timeout.count() < 0 ||
+        video_track.extra_data.size() > static_cast<std::size_t>((std::numeric_limits<int>::max)())) {
+        return false;
+    }
     if (output_url.empty()) {
         return false;
     }

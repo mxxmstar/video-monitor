@@ -1,5 +1,6 @@
 #include "media/pusher/ffmpeg_pusher.h"
 
+#include <cerrno>
 #include <filesystem>
 #include <iostream>
 #include <string>
@@ -28,6 +29,66 @@ bool IsFailure(const PusherResult& result, PusherErrorCategory expected) {
 
 int main() {
     FFmpegPusher pusher;
+
+    struct ErrorCase {
+        int code;
+        MuxerErrorCategory source;
+        PusherErrorCategory expected;
+        bool retryable;
+    };
+    const ErrorCase cases[] = {
+        {AVERROR(ECONNRESET), MuxerErrorCategory::WriteFailed, PusherErrorCategory::Network, true},
+        {AVERROR(ETIMEDOUT), MuxerErrorCategory::WriteFailed, PusherErrorCategory::Timeout, true},
+        {AVERROR_EXIT, MuxerErrorCategory::Timeout, PusherErrorCategory::Timeout, true},
+        {AVERROR_EXIT, MuxerErrorCategory::Cancelled, PusherErrorCategory::Cancelled, false},
+        {AVERROR_HTTP_UNAUTHORIZED, MuxerErrorCategory::WriteFailed, PusherErrorCategory::Authentication, false},
+        {AVERROR_HTTP_NOT_FOUND, MuxerErrorCategory::WriteFailed, PusherErrorCategory::NotFound, false},
+        {AVERROR_HTTP_TOO_MANY_REQUESTS, MuxerErrorCategory::WriteFailed, PusherErrorCategory::Network, true},
+        {AVERROR_HTTP_SERVER_ERROR, MuxerErrorCategory::WriteFailed, PusherErrorCategory::Network, true},
+        {AVERROR_PROTOCOL_NOT_FOUND, MuxerErrorCategory::WriteFailed, PusherErrorCategory::UnsupportedProtocol, false},
+        {AVERROR(ENOMEM), MuxerErrorCategory::WriteFailed, PusherErrorCategory::Internal, false},
+        {AVERROR(ENOSPC), MuxerErrorCategory::WriteFailed, PusherErrorCategory::WriteFailed, false},
+        {AVERROR_UNKNOWN, MuxerErrorCategory::WriteFailed, PusherErrorCategory::WriteFailed, false},
+    };
+    for (const auto& item : cases) {
+        const MuxerError error{item.source, item.code, "original error", MuxerOperation::WritePacket};
+        const auto result = MapMuxerError(error, true);
+        if (!IsFailure(result, item.expected) || result.error->retryable != item.retryable ||
+            result.error->message.find("WritePacket") == std::string::npos ||
+            result.error->message.find(std::to_string(item.code)) == std::string::npos ||
+            MapMuxerError(error, false).error->retryable) {
+            std::cerr << "Incorrect error mapping for " << item.code << std::endl;
+            return 1;
+        }
+    }
+    const auto close_error = MapMuxerError(
+        {MuxerErrorCategory::CloseFailed, AVERROR(ECONNRESET), "reset", MuxerOperation::WriteTrailer}, true);
+    if (close_error.error->retryable) {
+        std::cerr << "Finalization must not request reconnection" << std::endl;
+        return 1;
+    }
+
+    auto invalid_io = MakeValidConfig("unused.mp4");
+    invalid_io.io.connect_timeout = std::chrono::milliseconds(-1);
+    if (!IsFailure(pusher.Open(invalid_io), PusherErrorCategory::InvalidConfiguration)) return 1;
+    invalid_io.io.connect_timeout = std::chrono::milliseconds(0);
+    invalid_io.io.write_timeout = std::chrono::milliseconds(-1);
+    if (!IsFailure(pusher.Open(invalid_io), PusherErrorCategory::InvalidConfiguration)) return 1;
+
+    const auto bad_protocol = pusher.Open(MakeValidConfig("nonexistent-protocol://output.mp4"));
+    if (!IsFailure(bad_protocol, PusherErrorCategory::UnsupportedProtocol) ||
+        bad_protocol.error->retryable || pusher.IsOpen()) {
+        std::cerr << "Unknown protocol mapping failed" << std::endl;
+        return 1;
+    }
+    FFmpegMuxer muxer;
+    const auto muxer_error = muxer.Open("nonexistent-protocol://output.mp4",
+        MakeValidConfig("unused.mp4").video_track);
+    if (muxer_error.Succeed() || muxer_error.error->operation != MuxerOperation::OpenIo ||
+        muxer_error.error->native_code != AVERROR_PROTOCOL_NOT_FOUND || !muxer.Close().Succeed()) {
+        std::cerr << "Muxer lost native error or stage" << std::endl;
+        return 1;
+    }
 
     // Push 必须先经过 Open。这里不构造真实 AVPacket，也能稳定验证输出端的
     // 生命周期保护不会把未初始化的数据交给 FFmpeg。
@@ -78,6 +139,10 @@ int main() {
         pusher.Close();
         return 1;
     }
+    if (!pusher.IsOpen()) {
+        std::cerr << "Input validation invalidated an open output" << std::endl;
+        return 1;
+    }
 
     // Close 需要幂等，便于后续 PusherSession 在正常停止、打开失败清理和
     // 析构路径中都安全调用它。
@@ -87,6 +152,23 @@ int main() {
         return 1;
     }
 
+    std::filesystem::remove(output_path, file_error);
+    // Cancellation must be checked before dereferencing a packet, even for local I/O.
+    if (!muxer.Open(output_path.string(), MakeValidConfig("unused.mp4").video_track).Succeed()) return 1;
+    muxer.RequestStop();
+    const auto cancelled = muxer.Write(MediaPacket{});
+    if (cancelled.Succeed() || cancelled.error->category != MuxerErrorCategory::Cancelled ||
+        cancelled.error->native_code != AVERROR_EXIT ||
+        cancelled.error->operation != MuxerOperation::WritePacket) {
+        std::cerr << "Muxer did not preserve cancellation context" << std::endl;
+        return 1;
+    }
+    muxer.Close();
+    if (!muxer.Open(output_path.string(), MakeValidConfig("unused.mp4").video_track).Succeed() ||
+        !muxer.Close().Succeed()) {
+        std::cerr << "Reopen did not reset cancellation" << std::endl;
+        return 1;
+    }
     std::filesystem::remove(output_path, file_error);
     std::cout << "FFmpegPusher lifecycle test passed" << std::endl;
     return 0;

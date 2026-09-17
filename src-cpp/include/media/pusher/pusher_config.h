@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <chrono>
 
 #include "media/media_packet.h"
 #include <variant>
@@ -44,11 +45,18 @@ struct MediaTrackConfig {
     const VideoTrackConfig& video() const;
 };
 
+/// @brief Pusher 通用 I/O 配置
+struct PusherIoConfig {
+    std::chrono::milliseconds connect_timeout{5000};     ///< 连接超时时间 , 默认 5s
+    std::chrono::milliseconds write_timeout{10000};       ///< 写入超时时间 , 默认 10s
+};
+
 /// @brief 单个输出目标的最小配置。
 /// 初版只支持一条 H.264 视频轨道写入一个 FFmpeg 可识别的输出 URL。
 struct PusherConfig {
     std::string output_url;           ///< 输出文件路径或输出协议 URL
     MediaTrackConfig video_track;     ///< 已编码视频轨道的参数与时间基
-    
+    PusherIoConfig io;                ///< 0 禁用超时，负数无效
+
     bool is_valid() const;
 };

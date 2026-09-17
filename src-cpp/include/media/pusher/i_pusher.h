@@ -3,15 +3,14 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <functional>
 
 #include "media/media_packet.h"
 #include "media/pusher/pusher_config.h"
 
 /// @brief 输出端错误分类。
 ///
-/// PusherSession 后续可依据此分类决定状态迁移或重连策略。初版中 Muxer
-/// 只返回 bool，尚不能可靠区分网络瞬断和本地写盘失败，因此不会猜测
-/// retryable 的值。
+/// Pusher 映射底层错误并决定 retryable，Session 不需要理解 FFmpeg 错误码。
 enum class PusherErrorCategory {
     InvalidConfiguration,  ///< 输出 URL 或轨道配置不完整
     InvalidState,          ///< 在未打开状态 Push 等生命周期错误
@@ -20,6 +19,13 @@ enum class PusherErrorCategory {
     OpenFailed,            ///< 底层输出容器打开失败
     WriteFailed,           ///< 底层输出容器写包失败
     Internal,              ///< Pusher 实现或会话依赖未正确初始化
+    Cancelled,
+    Timeout,
+    Authentication,
+    NotFound,
+    UnsupportedProtocol,
+    Network,
+    CloseFailed,
 };
 
 /// @brief Pusher 对外暴露的结构化错误。
@@ -43,6 +49,7 @@ struct PusherResult {
     }
 };
 
+
 /// @brief 单个底层输出连接的最小接口。
 ///
 /// IPusher 负责把已经编码好的 packet 写入一个确定输出目标；它不决定
@@ -63,4 +70,10 @@ public:
 
     /// @brief 返回当前输出目标是否已经成功打开。
     virtual bool IsOpen() const = 0;
+
+    /// @brief 输出端事件回调（协议异常等）
+    using EventCallback = std::function<void(const std::string&)>;
+
+    /// @brief 设置事件回调
+    virtual void SetEventCallback(EventCallback cb) { (void)cb; }
 };
