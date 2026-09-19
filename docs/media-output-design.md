@@ -483,3 +483,221 @@ RTSP Server 路线的实现顺序：
 6. 验证输出结果与当前直接调用 Muxer 时一致。
 
 完成 `FFmpegPusher` 后再实现 `PusherSession`，这样每一层的引入原因都可以通过测试直接观察到。
+
+## 8. 推流配置扩展计划（2026-09-17 追加）
+
+本节是下一轮实现计划，更新第 7 节的推进顺序；结构体和示例均为拟议接口，
+不表示当前代码已经支持这些配置或完成 ZLMediaKit 联调。
+下一步先补齐输出配置，再验证网络推流，之后实现 Session 自动重连。
+
+### 8.1 对齐 Puller 的组织方式
+
+参考 `src-cpp/include/media/puller/puller_config.h`，采用通用参数、协议专用
+参数和 FFmpeg 扩展参数分组。复用设计方式，不直接复用输入端结构体：
+
+| Puller 配置 | 输出端对应设计 |
+|---|---|
+| 输入 URI | 保留 `PusherConfig::output_url`，地址只保存一份 |
+| connect/read timeout | `PusherConfig::io` 中的 connect/write timeout |
+| `FFmpegPullerConfig::input_format` | `FFmpegPusherConfig::output_format` |
+| `RtspInputOptions` 等 | 独立的 `RtspOutputOptions`、`RtmpOutputOptions` |
+| `extra_av_options` | 按 AVIO 和 muxer 两个接收入口分组 |
+| probe、分析时长、接收重排队列 | 输出端不引入；轨道参数由上游提供 |
+
+当前只有 FFmpeg 输出实现，先增加 `PusherConfig::ffmpeg`，不提前引入
+只有一个成员的 variant 或重复的 PusherKind。将来增加非 FFmpeg 后端时，
+再将具体后端配置收敛为类似 `PullerSpecificConfig` 的 variant。
+
+### 8.2 配置归属
+
+| 层 | 配置与职责 |
+|---|---|
+| Publisher | 选择输出实现、提供应用入口，不重复保存 URL、协议参数 |
+| PusherSession | 关键帧等待、重连次数、退避、恢复策略 |
+| Pusher | 输出地址、轨道、IO 超时、格式与协议选项；校验、转换和错误映射 |
+| Muxer | 接收转换后的执行参数；管理 FFmpeg context、字典、deadline 和中断回调 |
+
+IO 的用户配置归 Pusher，执行状态归 Muxer。Muxer 不读取
+`PusherConfig`，不返回 `PusherError`，也不决定是否重连。
+轨道描述应放到共享媒体配置头文件，避免 Muxer 为使用轨道类型而包含
+Pusher 配置头文件。
+
+### 8.3 第一批配置定义
+
+第一批覆盖本地文件、RTSP Client 和 RTMP Client，保留当前单路 H.264 限制。
+以下示意使用 `std::optional` 区分“未指定”和“显式设置”：
+
+```cpp
+enum class RtspOutputTransport { Tcp, Udp };
+
+struct RtspOutputOptions {
+    RtspOutputTransport transport{RtspOutputTransport::Tcp};
+};
+
+struct RtmpOutputOptions {
+    std::optional<std::string> app;
+    std::optional<std::string> playpath;
+    std::optional<bool> tcp_nodelay;
+};
+
+struct FFmpegPusherConfig {
+    std::optional<std::string> output_format;
+    std::optional<RtspOutputOptions> rtsp;
+    std::optional<RtmpOutputOptions> rtmp;
+    std::map<std::string, std::string> extra_io_options;
+    std::map<std::string, std::string> extra_muxer_options;
+};
+
+struct PusherConfig {
+    std::string output_url;
+    MediaTrackConfig video_track;
+    PusherIoConfig io;
+    FFmpegPusherConfig ffmpeg;
+};
+```
+
+`PusherIoConfig` 保留 `connect_timeout{5000ms}` 和
+`write_timeout{10000ms}`；0 表示禁用对应 deadline，负数无效。
+`connect_timeout` 覆盖整个打开过程，包括 AVIO 连接和 write_header 中的
+协议协商；`write_timeout` 用于写包及关闭阶段的阻塞操作。
+这些是依赖 FFmpeg 中断回调的超时约束，不承诺能强制中断所有系统调用。
+
+第一版认证参数通过目标 URL 提供，不增加 `zlmediakit` 专用配置。
+URL 中的用户名、密码、查询令牌必须在日志和诊断信息中脱敏。
+后续若增加独立认证字段，应明确与 URL 内凭据冲突时的处理规则。
+
+SRT 的 mode、stream_id、latency、passphrase 和 TLS 证书选项延后加入。
+输入端的 RTMP live_mode、subscribe、HTTP reconnect 等选项不直接复制，
+每个输出字段都必须确认当前 FFmpeg 构建确实支持其发送端语义。
+
+### 8.4 输出格式解析
+
+Pusher 在打开任何输出资源之前解析格式，不能只依赖 FFmpeg 根据 URL 扩展名猜测：
+
+| 目标 | 默认输出格式 | 规则 |
+|---|---|---|
+| 本地文件、file URL | 根据扩展名推断 | 无扩展名或无法推断时要求显式配置 |
+| rtsp URL | `rtsp` | 使用 RTSP muxer，由 write_header 建立发布会话 |
+| rtmp、rtmps URL | `flv` | 使用 FLV muxer，经 AVIO 连接服务器 |
+| srt URL | 后续阶段默认 `mpegts` | 需先验证 FFmpeg 构建支持 SRT |
+| 其他网络协议 | 要求显式配置 | 不猜测容器，不声称已支持 |
+
+显式 `output_format` 优先于默认推断，但与第一批协议约束冲突时返回
+`InvalidConfiguration`，例如 RTMP + MP4、RTSP + FLV。
+显式空字符串视为无效，未设置才表示自动解析。
+协议名解析需要处理大小写，并识别 Windows 盘符，不能把 `C:\\...` 当作网络协议。
+格式、协议是否可用还需要查询当前 FFmpeg 构建能力；配置存在不等于库已启用对应模块。
+
+### 8.5 转换为 Muxer 执行参数
+
+由 Pusher 生成独立参数，Muxer 只执行：
+
+```cpp
+struct MuxerOpenOptions {
+    std::string output_url;
+    std::string format_name;
+    MuxerIoOptions io;
+    std::map<std::string, std::string> io_options;
+    std::map<std::string, std::string> muxer_options;
+};
+
+// Shared MediaTrackConfig is independent of PusherConfig.
+MuxerResult Open(const MuxerOpenOptions& options,
+                 const MediaTrackConfig& track);
+```
+
+映射规则：
+
+| 来源 | FFmpeg 选项或调用入口 |
+|---|---|
+| 解析后的 format_name | `avformat_alloc_output_context2` 的 format_name |
+| RTSP transport | `rtsp_transport=tcp/udp`，传入 write_header 字典 |
+| RTMP app、playpath、tcp_nodelay | `rtmp_app`、`rtmp_playpath`、`tcp_nodelay`，传入 AVIO 字典 |
+| extra_io_options | `avio_open2(..., &io_dict)` |
+| extra_muxer_options | `avformat_write_header(..., &muxer_dict)` |
+| connect/write timeout | Muxer deadline 和 interrupt callback |
+
+RTSP 属于 `AVFMT_NOFILE`，不调用 `avio_open2`；第一版拒绝为该目标配置
+非空 extra_io_options，避免静默忽略。以后需要 RTSP 内部 socket 参数时，
+应验证其在 RTSP muxer 的选项入口，再增加对应字段。
+
+结构化字段与同入口扩展字典出现同名选项时返回配置错误，避免隐含覆盖优先级。
+连接与写入超时以结构化 IO 字段为唯一来源；扩展字典中的超时或自动重连选项
+需拒绝或在后续建立明确语义后开放，防止与 deadline、Session 策略冲突。
+
+Muxer 用独立 AVDictionary 执行调用，所有成功、失败路径都释放字典。
+成功调用后检查未消费的选项：返回包含选项名和阶段的结构化错误，由 Pusher
+映射为不可重试的配置错误，不能静默成功。该检查可能发生在资源已经打开之后，
+失败时必须完成清理；诊断不输出可能包含凭据的选项值。
+
+### 8.6 参数校验与错误边界
+
+Pusher 负责以下检查：
+
+- URL、轨道类型、H.264 编码能力、尺寸、帧率、时间基和 extradata 长度合法；
+- 超时非负；RTSP/RTMP 专用字段与目标协议一致，禁止同时启用不相关的协议组；
+- 格式与协议组合有效，选项无冲突，枚举值受支持；
+- Push 的媒体类型、后端句柄、载荷、时间基和 duration 符合约定。
+
+H.264 推流需要可用的 SPS/PPS。第一批 ZLMediaKit 联调要求上游在 Open 前提供
+有效 extradata，并在开始发送时提供可解码关键帧；仅检查 extra_data 非空并不能
+证明其合法。需要验证编码器输出的 Annex B/AVCC 与所选 muxer 的兼容性，
+不能靠改格式名称假定转换正确。后续再考虑从首包提取参数或增加 bitstream filter。
+
+Muxer 保留 FFmpeg 原始错误码、错误文本和操作阶段；对于未消费选项等自定义错误，
+提供明确的本地原因，不伪造 FFmpeg 返回码。Pusher 映射为统一错误和 retryable。
+Session 只消费映射结果，不解析错误文本或 AVERROR。
+
+网络超时、连接中断、可识别的服务端暂时错误可以标记可重连；配置错误、
+协议不支持、认证失败、主动取消和未知错误默认不可重连。本地文件和关闭阶段
+不自动重连，避免重开文件截断已有内容或重新创建已结束的输出任务。
+
+### 8.7 ZLMediaKit 配置示例与验证
+
+RTSP 推荐先验证 TCP：
+
+```cpp
+PusherConfig config;
+config.output_url = "rtsp://127.0.0.1:554/live/camera";
+config.video_track = encoded_track; // H.264, time base, dimensions and SPS/PPS
+config.ffmpeg.rtsp = RtspOutputOptions{}; // TCP
+config.io.connect_timeout = std::chrono::milliseconds{5000};
+config.io.write_timeout = std::chrono::milliseconds{10000};
+```
+
+RTMP 使用另一份配置，不能携带上一份配置的 rtsp 选项：
+
+```cpp
+PusherConfig config;
+config.output_url = "rtmp://127.0.0.1:1935/live/camera";
+config.video_track = encoded_track;
+config.ffmpeg.rtmp = RtmpOutputOptions{};
+config.ffmpeg.rtmp->tcp_nodelay = true;
+// output_format omitted: Pusher resolves RTMP to FLV.
+```
+
+地址和端口以实际 ZLMediaKit 部署为准，服务器需要开放对应端口并允许发布。
+ZLMediaKit 是远端服务，不作为 Pusher 的新后端类型。
+`Open()` 成功只证明初始化成功；验收还应检查服务端媒体注册、播放端解码、
+首关键帧、连续时间戳和断开后的资源释放。
+
+### 8.8 实施顺序与验收
+
+1. 配置模型：增加 FFmpeg 分组、RTSP/RTMP 专用配置；迁移共享轨道类型；
+   保留 output_url、video_track、io 的现有入口，默认 MP4 用法不变。
+2. 解析与校验：实现可独立测试的格式解析、协议匹配、选项转换和冲突检查；
+   覆盖 Windows 路径、大小写协议、无扩展名、显式格式、负超时及错误选项。
+3. Muxer 接入：显式指定格式，分别传入 AVIO/muxer 字典；验证失败清理、
+   未消费选项、超时和取消仍保留原始阶段。
+4. Publisher 命名：将 FFmpegFile 迁移为 FFmpegOutput，按需要保留旧名兼容；
+   不按 RTSP/RTMP 增加 Publisher 分支。
+5. 回归与联调：先通过本地 MP4、时间戳和 Session 测试，再分别验证 ZLMediaKit
+   RTSP/TCP、RTMP 的单路 H.264 发布与播放；加入连接拒绝、认证拒绝、
+   服务端断开以及可控本地测试服务制造的超时测试。
+6. 后续扩展：网络推流基线通过后，再增加 Session 重连配置与退避状态机，
+   然后扩展 SRT、TLS 专用参数、音频及多轨。
+
+重连配置只加入 PusherSessionConfig，建议后续提供 enabled、
+max_reconnect_attempts、initial_delay、max_delay 和 backoff_multiplier。
+消费式写包失败后不重发原包；重连成功后等待新关键帧。
+重连机制不能替代本阶段的格式、选项和媒体参数校验。
