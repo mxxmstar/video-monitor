@@ -11,6 +11,20 @@ PusherResult MakeFailure(PusherErrorCategory category, std::string message, bool
     return PusherResult::Failed(PusherError{category, std::move(message), retryable});
 }
 
+bool IsNetworkOutput(const std::string& output_url) {
+    const char* protocol = avio_find_protocol_name(output_url.c_str());
+    bool network_output = false;
+    for (const char* name : {"tcp", "udp", "http", "https", "rtmp", "rtmps",
+                             "rtmpt", "rtmpts", "srt", "rist"}) {
+        if (protocol && std::strcmp(protocol, name) == 0) network_output = true;
+    }
+    // RTSP is an AVFMT_NOFILE muxer, not an AVIO protocol.
+    if (output_url.rfind("rtsp://", 0) == 0 || output_url.rfind("rtsps://", 0) == 0) {
+        network_output = true;
+    }
+    return network_output;
+}
+
 }  // namespace
 
 /// @brief 将 Muxer 中的错误映射到 Pusher 中的错误分类
@@ -95,17 +109,22 @@ PusherResult FFmpegPusher::Open(const PusherConfig& config) {
                            "FFmpegPusher currently supports H264 video only");
     }
 
-    const char* protocol = avio_find_protocol_name(config.output_url.c_str());
-    network_output_ = false;
-    for (const char* name : {"tcp", "udp", "http", "https", "rtmp", "rtmps",
-                             "rtmpt", "rtmpts", "srt", "rist"}) {
-        if (protocol && std::strcmp(protocol, name) == 0) network_output_ = true;
+    network_output_ = IsNetworkOutput(config.output_url);
+    MuxerOptions muxer_op = {};
+    if (config.ffmpeg.rtsp.has_value()) {
+        muxer_op.protocol = "rtsp";
+        muxer_op.extra_muxer_options["transport"] = config.ffmpeg.rtsp->transport;
+    } else if (config.ffmpeg.rtmp.has_value()) {
+        // muxer_op["app"] = config.ffmpeg.rtmp->app;
+        // muxer_op["playpath"] = config.ffmpeg.rtmp->playpath;
+        // muxer_op["tcp_nodelay"] = config.ffmpeg.rtmp->tcp_nodelay;
     }
-    // RTSP is an AVFMT_NOFILE muxer, not an AVIO protocol.
-    if (config.output_url.rfind("rtsp://", 0) == 0 ||
-        config.output_url.rfind("rtsps://", 0) == 0) network_output_ = true;
+
+    for (const auto& option : config.ffmpeg.extra_muxer_options) {
+        muxer_op.extra_muxer_options[option.first] = option.second;
+    }
     MuxerResult muxer_result = muxer_.Open(config.output_url, config.video_track,
-        MuxerIoOptions{config.io.connect_timeout, config.io.write_timeout});
+        MuxerIoOptions{config.io.connect_timeout, config.io.write_timeout}, muxer_op);
     if (!muxer_result.Succeed()) {
         return MapMuxerError(*muxer_result.error, network_output_);
     }

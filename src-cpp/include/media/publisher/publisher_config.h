@@ -9,6 +9,7 @@
 /// 扩展枚举和值对应的配置类型即可。
 enum class PublisherKind {
     FFmpegFile,
+    ZLMRTSP,
 };
 
 /// @brief 对上层暴露的一次发布任务配置。
@@ -22,6 +23,6 @@ struct PublisherConfig {
 
     /// @brief 校验当前 Publisher 是否能创建所选路线及其会话。
     bool is_valid() const {
-        return kind == PublisherKind::FFmpegFile && session.is_valid();
+        return session.is_valid();
     }
 };

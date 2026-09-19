@@ -11,6 +11,7 @@ extern "C" {
 #include <libavutil/opt.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/mem.h>
+#include <libavutil/dict.h>
 }
 namespace {
 /// @brief 获取 FFmpeg 错误码对应的错误字符串
@@ -28,6 +29,9 @@ bool IsFileOutputUrl(const std::string& url) {
     return protocol != nullptr && std::strcmp(protocol, "file") == 0;
 }
 
+bool IsRtspOutputUrl(const std::string& url) {
+    return url.find("rtsp") != std::string::npos;
+}
 
 }
 
@@ -42,7 +46,8 @@ FFmpegMuxer::~FFmpegMuxer() {
 
 
 
-MuxerResult FFmpegMuxer::Open(const std::string& output_url, const MediaTrackConfig& config, const MuxerIoOptions& io) {
+MuxerResult FFmpegMuxer::Open(const std::string& output_url, const MediaTrackConfig& config, 
+    const MuxerIoOptions& io, const MuxerOptions& muxer_options) {
     // Open 可以重复调用。先关闭旧的输出，保证旧的 AVIO 和 AVFormatContext
     // 不会泄漏，也避免新的 stream 挂到旧 context 上。
     const auto close_result = Close();
@@ -57,8 +62,16 @@ MuxerResult FFmpegMuxer::Open(const std::string& output_url, const MediaTrackCon
     timestamp_offset_ = 0;
 
     // 分配 AVFormatContext
-    // 第三个参数 format_name 这里暂时不管，让 FFmpeg 自动选择
-    int ret = avformat_alloc_output_context2(&format_ctx_, nullptr, nullptr, output_url_.c_str());
+    // 第三个参数 format_name：对于 RTSP/RTMP 等无扩展名的 URL，需要手动指定格式
+    const char* format_name = nullptr;
+    // RTSP/RTMP 是 AVFMT_NOFILE muxer，avio_find_protocol_name 检测不到，需要手动判断
+    if (IsRtspOutputUrl(output_url_)) {
+        format_name = "rtsp";
+    } else if (output_url_.rfind("rtmp://", 0) == 0 || output_url_.rfind("rtmps://", 0) == 0) {
+        format_name = "flv";
+    }
+    
+    int ret = avformat_alloc_output_context2(&format_ctx_, nullptr, format_name, output_url_.c_str());
     if (ret < 0 || !format_ctx_) {
         LOG_ERROR("avformat_alloc_output_context2 failed: {}", AvErrorString(ret));
         Close();
@@ -119,6 +132,19 @@ MuxerResult FFmpegMuxer::Open(const std::string& output_url, const MediaTrackCon
             return result;
         }
     }
+
+    AVDictionary* options = nullptr;
+
+    for (const auto& option : muxer_options.extra_muxer_options) {
+        ret = av_dict_set(&options, option.first.c_str(), option.second.c_str(), 0);
+        if (ret < 0) {
+            // auto result = failure(MuxerOperation::SetOption, MuxerErrorCategory::OpenFailed, ret);
+            // Close();
+            // return result;
+            LOG_WARN("av_dict_set option [{}, {}] failed: {}", option.first, option.second, AvErrorString(ret));
+        }
+    }
+
 
     // 打开过程包括由 write_header（例如 RTSP）执行的协议协商。
     ret = avformat_write_header(format_ctx_, nullptr);

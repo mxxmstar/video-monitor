@@ -29,7 +29,8 @@ constexpr int kExpectedPacketCount = 10;
 constexpr int kExpectedFrameCount = 10;
 constexpr int kMaxReadAttempts = INT_MAX;
 
-constexpr int kMaxTestSeconds = 60;
+constexpr int kMaxTestSeconds = 180;
+constexpr const char* kRtspPushOutputUrl = "rtsp://127.0.0.1/live/test_zlm_rtsp";
 
 FFmpegPullerConfig testPullerConfig() {
     FFmpegPullerConfig config;
@@ -778,11 +779,374 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
     return 0;
 }
 #endif
+
+int RunFfmpegPullerDecoderConverterEncoderPushTest() {
+    auto config = testPullerConfig();     
+    auto endpoint = testInputEndpoint();
+
+    FFmpegPuller puller(std::move(config));
+
+    LOG_INFO("Opening RTSP stream: {}", endpoint.uri);
+    const PullOpenResult open_result = puller.Open(endpoint);
+    if (!open_result.Succeed()) {
+        LOG_ERROR("Open failed: {}", (open_result.error.has_value()
+                          ? open_result.error->message
+                          : "unknown error"));
+        return 1;
+    }
+
+    const MultiStreamInfo stream_info = puller.GetStreamInfo();
+    if (!stream_info.HasVideoStream() && !stream_info.HasAudioStream()) {
+        LOG_ERROR("Open succeeded, but no audio or video stream was found");
+        puller.Close();
+        return 1;
+    }
+    const MediaStreamInfo& video_stream_info =
+        stream_info.stream_infos[stream_info.video_stream_idx_];
+    video_stream_info.Dump(false);
+
+    LOG_INFO("Stream info: {}", stream_info.stream_infos.size());
+
+    FFmpegDecoder decoder;
+    int64_t decoded_frames = 0;
+    int64_t decoded_packets = 0;
+    int64_t decode_calls = 0;
+    int64_t decode_errors = 0;
+    int64_t decode_total_us = 0;
+    uint32_t decode_min_us = UINT32_MAX;
+    uint32_t decode_max_us = 0;
+    uint32_t decode_avg_us = 0;
+
+
+    MediaFrameConverter converter;
+    int64_t converted_frames = 0;
+    int64_t convert_errors = 0;
+    int64_t convert_total_us = 0;
+    uint32_t convert_min_us = UINT32_MAX;
+    uint32_t convert_max_us = 0;
+    uint32_t convert_avg_us = 0;
+
+    // 这里先硬编码一个视频宽高，防止converter打开失败
+    MediaFrameConverterConfig convert_config;
+    convert_config.backend = ConvertBackend::FFmpeg;
+    convert_config.video.width = video_stream_info.video().width > 0 ? video_stream_info.video().width : 1920;
+    convert_config.video.height = video_stream_info.video().height > 0 ? video_stream_info.video().height : 1080;
+    convert_config.video.pixel_format = PixelFormat::kI420;
+
+    EncoderConfig encoder_config;
+    encoder_config.media_type = MediaType::VIDEO;
+    encoder_config.codec_type = CodecType::H264;
+    encoder_config.bitrate = 2'000'000;
+    encoder_config.thread_count = 1;
+
+    VideoEncoderConfig& video_enc_cfg = encoder_config.video();
+    video_enc_cfg.width = video_stream_info.video().width > 0 ? video_stream_info.video().width : 1920;
+    video_enc_cfg.height = video_stream_info.video().height > 0 ? video_stream_info.video().height : 1080;
+    LOG_INFO("Video h x w: {} x {}", video_enc_cfg.height, video_enc_cfg.width);
+    // video_enc_cfg.fps_num = 30;
+    video_enc_cfg.fps_num = 25;
+    video_enc_cfg.fps_den = 1;
+    video_enc_cfg.pixel_format = PixelFormat::kI420;
+    video_enc_cfg.gop_size = 50;
+    video_enc_cfg.max_b_frames = 0;
+    video_enc_cfg.preset = "ultrafast";
+    video_enc_cfg.tune = "zerolatency";
+
+    FFmpegEncoder encoder;
+    int64_t encoded_frames = 0;
+    int64_t encoded_packets = 0;
+    int64_t encode_calls = 0;
+    int64_t encode_errors = 0;
+    int64_t encode_total_us = 0;
+    uint32_t encode_min_us = UINT32_MAX;
+    uint32_t encode_max_us = 0;
+    uint32_t encode_avg_us = 0;
+
+    Publisher publisher;
+    int64_t muxed_packets = 0;
+    // 解码器回调在当前同步测试中由 Decode() 直接触发。用这个标志把回调
+    // 内部的 Publisher 写入失败反馈给外层测试循环，避免只打印日志却误报通过。
+    bool publisher_write_failed = false;
+
+    decoder.SetFrameCallback([&](std::shared_ptr<MediaFrame> frame) {
+        if (!frame || frame->type != MediaType::VIDEO) {
+            return;
+        }
+        
+        LOG_INFO("Decoded frame {}: {}x{}, pixel_format={}, pts_us={}",
+                  decoded_frames, frame->Width(), frame->Height(),
+                  static_cast<int>(frame->PixelFormat()), frame->time.pts_us);
+
+        
+        LOG_INFO("Decoded frame {}: {}x{}, pixel_format={}, pts_us={}",
+                  decoded_frames, frame->Width(), frame->Height(),
+                  static_cast<int>(frame->PixelFormat()), frame->time.pts_us);
+
+
+        std::shared_ptr<MediaFrame> converted_frame;
+        auto before_convert_time = std::chrono::steady_clock::now();
+        if (!converter.Convert(*frame, converted_frame)) {
+            LOG_ERROR("Failed to convert frame {}: {}", decoded_frames, MediaFrameConverter::LastError());
+            return;
+        }
+        auto after_convert_time = std::chrono::steady_clock::now();
+        auto convert_duration_us = std::chrono::duration_cast<std::chrono::microseconds>(after_convert_time - before_convert_time).count();
+        convert_total_us += convert_duration_us;
+        convert_min_us = std::min(convert_min_us, static_cast<uint32_t>(convert_duration_us));
+        convert_max_us = std::max(convert_max_us, static_cast<uint32_t>(convert_duration_us));
+        convert_avg_us = static_cast<uint32_t>(convert_total_us / ++converted_frames);                
+        
+        LOG_INFO("Converted frame {}: {}x{}, pixel_format={}, pts_us={}",
+                  converted_frames, converted_frame->Width(), converted_frame->Height(),
+                  static_cast<int>(converted_frame->PixelFormat()), converted_frame->time.pts_us);
+                
+        std::vector<PacketPtr> packets;
+        auto before_encode_time = std::chrono::steady_clock::now();
+        if (!encoder.Encode(converted_frame, packets)) {
+            LOG_ERROR("Failed to encode frame {}", decoded_frames);
+            return;
+        }
+        auto after_encode_time = std::chrono::steady_clock::now();
+        auto encode_duration_us = std::chrono::duration_cast<std::chrono::microseconds>(after_encode_time - before_encode_time).count();
+        encode_total_us += encode_duration_us;
+        encode_min_us = std::min(encode_min_us, static_cast<uint32_t>(encode_duration_us));
+        encode_max_us = std::max(encode_max_us, static_cast<uint32_t>(encode_duration_us));
+        encode_avg_us = static_cast<uint32_t>(encode_total_us / ++encoded_frames);                
+        
+        for (const auto& packet : packets) {
+            ++encoded_packets;            
+            LOG_INFO("Encoded packet {}: size={}, pts={}, keyframe={}", encoded_packets,
+                      (packet->buffer ? packet->buffer->Size() : 0), packet->pts, packet->keyframe);
+            
+            const PusherPublishResult publish_result = publisher.Publish(*packet);
+            if (!publish_result.Succeed()) {
+                publisher_write_failed = true;
+                LOG_ERROR("Failed to push packet {}: {}", encoded_packets, publish_result.error.has_value()
+                              ? publish_result.error->message : "unknown publisher error");
+            } else if (publish_result.WasPublished()) {
+                ++muxed_packets;
+            }
+        }
+    });
+    
+    // Open() 会根据 H.264 的 codec、time_base 和 SPS/PPS extra_data 创建
+    // AVCodecContext。若这一步失败，继续读取包没有意义。
+    if (!decoder.Open(video_stream_info)) {
+        LOG_ERROR("Failed to open video decoder");
+        puller.Close();
+        return 1;
+    }
+
+    if (!encoder.Open(encoder_config)) {
+        LOG_ERROR("Failed to open video encoder");
+        decoder.Close();
+        puller.Close();
+        return 1;
+    }
+
+    if (!converter.Open(convert_config)) {
+        LOG_ERROR("Failed to open frame converter: {}", MediaFrameConverter::LastError());
+        encoder.Close();
+        decoder.Close();
+        puller.Close();
+        return 1;
+    }
+
+    // 获取编码器输出信息，用于配置 muxer
+    EncodedTrackInfo encoded_track_info = encoder.GetOutputInfo();
+    if (!encoded_track_info.is_valid()) {
+        LOG_ERROR("Failed to get valid encoded track info from encoder");
+        converter.Close();
+        encoder.Close();
+        decoder.Close();
+        puller.Close();
+        return 1;
+    }
+
+    // 构造视频轨道配置。Pusher 会将它交给内部的 FFmpegMuxer 创建输出流。
+    MediaTrackConfig muxer_config;
+    muxer_config.media_type = encoded_track_info.media_type;
+    muxer_config.codec_type = encoded_track_info.codec_type;
+    muxer_config.time_base_num = encoded_track_info.time_base.num;
+    muxer_config.time_base_den = encoded_track_info.time_base.den;
+    muxer_config.extra_data = encoded_track_info.extra_data;
+    
+    VideoTrackConfig& video_track = std::get<VideoTrackConfig>(muxer_config.track_config);
+    video_track.width = std::get<VideoTrackInfo>(encoded_track_info.specific).width;
+    video_track.height = std::get<VideoTrackInfo>(encoded_track_info.specific).height;
+    video_track.fps = std::get<VideoTrackInfo>(encoded_track_info.specific).fps;
+
+    // Session 先打开内部 Pusher，再进入 WaitingForKeyframe。这样后续即使
+    // Pusher 发生替换，调用方也不需要了解 FFmpegMuxer 的具体细节。
+    const std::string output_file = kRtspPushOutputUrl;
+    PublisherConfig publisher_config;
+    publisher_config.kind = PublisherKind::ZLMRTSP;
+    publisher_config.session.pusher.output_url = output_file;
+    publisher_config.session.pusher.video_track = muxer_config;
+    const PusherResult session_open_result = publisher.Open(publisher_config);
+    if (!session_open_result.Succeed()) {
+        LOG_ERROR("Failed to open publisher for {}: {}", output_file,
+                  session_open_result.error.has_value()
+                      ? session_open_result.error->message : "unknown publisher error");
+        converter.Close();
+        encoder.Close();
+        decoder.Close();
+        puller.Close();
+        return 1;
+    }
+    LOG_INFO("Publisher opened: {}", output_file);
+
+    int packet_count = 0;
+    auto start_time = std::chrono::steady_clock::now();
+    while(1) {
+        auto end_time = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time).count() >= kMaxTestSeconds) {
+            break;
+        }
+
+        const PullReadResult read_result = puller.ReadPacket();
+
+        if (read_result.status == PullReadStatus::NoData) {
+            continue;
+        }
+
+        if (read_result.status != PullReadStatus::Packet ||
+            !read_result.packet ||
+            !read_result.packet->buffer ||
+            read_result.packet->buffer->Size() == 0) {
+            LOG_ERROR("Read failed at attempt {}: status={}",
+                      static_cast<int>(read_result.status), (read_result.error.has_value() ? read_result.error->message : "unknown error"));
+            if (read_result.error.has_value()) {
+                LOG_ERROR(", error={}", read_result.error->message);    
+            }
+            puller.Close();
+            return 1;
+        }
+
+        if (read_result.packet->stream_index != video_stream_info.stream_index) {
+            continue;
+        }
+
+        // stream_index 是首要依据；type/codec 的检查是测试层防御，能够在
+        // Puller 的媒体元数据与实际视频轨道不一致时给出清晰报错。
+        if (read_result.packet->type != MediaType::VIDEO ||
+            read_result.packet->codec != video_stream_info.codec_type) {
+            LOG_ERROR("Video stream packet metadata does not match decoder");
+            decoder.Close();
+            puller.Close();
+            return 1;
+        }
+
+        ++packet_count;
+        auto decode_start_time = Now();
+        if (!decoder.Decode(read_result.packet)) {
+            LOG_ERROR("Video decode failed at video packet {}", packet_count);
+            decoder.Close();
+            puller.Close();
+            return 1;
+        }
+        if (publisher_write_failed) {
+            LOG_ERROR("Publisher write failed while processing video packet {}", packet_count);
+            decoder.Close();
+            encoder.Close();
+            publisher.Close();
+            puller.Close();
+            return 1;
+        }
+        auto decode_end_time = Now();
+        auto decode_duration_us = decode_end_time - decode_start_time;
+        decode_total_us += decode_duration_us;
+        decode_min_us = std::min(decode_min_us, static_cast<uint32_t>(decode_duration_us));
+        decode_max_us = std::max(decode_max_us, static_cast<uint32_t>(decode_duration_us));
+        decode_avg_us = static_cast<uint32_t>(decode_total_us / ++decoded_frames);
+        
+        LOG_INFO("Packet {}: type={}, codec={}, stream_index={}, size={}",
+                 packet_count, static_cast<int>(read_result.packet->type),
+                 static_cast<int>(read_result.packet->codec), read_result.packet->stream_index,
+                 read_result.packet->buffer->Size());
+    }
+
+    // H.264 可能缓存 B 帧。即使读取循环已经停止，也要先向 decoder 发送
+    // 空包进行 drain，才能拿到所有已接收编码包对应的尾部输出帧。
+    if (!decoder.Flush()) {
+        LOG_ERROR("Failed to flush video decoder");
+        decoder.Close();
+        encoder.Close();
+        puller.Close();
+        return 1;
+    }
+
+    std::vector<PacketPtr> flush_packets;
+    if (!encoder.Flush(flush_packets)) {
+        LOG_ERROR("Failed to flush video encoder");
+        decoder.Close();
+        encoder.Close();
+        puller.Close();
+        return 1;
+    }
+
+    for (const auto& packet : flush_packets) {
+        ++encoded_packets;
+        LOG_INFO("Flush packet {}: size={}, pts={}, keyframe={}", encoded_packets,
+                 packet->buffer ? packet->buffer->Size() : 0, packet->pts, packet->keyframe);
+        
+        // Flush 期间产生的尾部编码包也必须经过同一个 Session，保证正常包和
+        // 编码器缓存包遵循同一份关键帧策略与输出校验路径。
+        const PusherPublishResult publish_result =
+            publisher.Publish(*packet);
+        if (!publish_result.Succeed()) {
+            publisher_write_failed = true;
+            LOG_ERROR("Failed to push flush packet {}: {}", encoded_packets,
+                      publish_result.error.has_value()
+                          ? publish_result.error->message
+                          : "unknown publisher error");
+        } else if (publish_result.WasPublished()) {
+            ++muxed_packets;
+        }
+    }
+
+    if (publisher_write_failed) {
+        LOG_ERROR("Publisher write failed while flushing encoder packets");
+        decoder.Close();
+        encoder.Close();
+        publisher.Close();
+        puller.Close();
+        return 1;
+    }
+
+    // 先 Flush 再 Close：Close 只释放 AVCodecContext，不会主动输出缓存帧。
+    decoder.Close();
+    encoder.Close();
+    publisher.Close();
+    puller.Close();
+
+    // 成功结果只表达测试真正验证的条件：已经解码出目标数量的视频帧。
+    // video_packet_count 是过程诊断数据，不能作为“10 帧必须来自 10 包”
+    // 的断言依据。
+    LOG_INFO("FFmpegPuller -> FFmpegDecoder -> MediaFrameConverter -> FFmpegEncoder -> PusherSession test passed");
+    LOG_INFO("Muxed packets: {}", muxed_packets);
+    LOG_INFO("=======================");
+    decoder.PrintStats();
+    LOG_INFO("=======================");
+    converter.PrintStats();
+    LOG_INFO("=======================");
+    encoder.PrintStats();
+    LOG_INFO("=======================");
+    // LOG_INFO("Convert stats: convert {} frames, min convert time: {} us, max convert time: {} us, avg convert time: {} us, total convert time: {} us", converted_frames, convert_min_us, convert_max_us, convert_avg_us, convert_total_us);
+    LOG_INFO("=======================");
+    // LOG_INFO("Encode stats: encode {} frames, min encode time: {} us, max encode time: {} us, avg encode time: {} us, total encode time: {} us", encoded_frames, encode_min_us, encode_max_us, encode_avg_us, encode_total_us);
+    // LOG_INFO("Diagnostic: " << video_packet_count
+    //     << " video packet(s) consumed from " << input_packet_count
+    //     << " input packet(s)");
+    // LOG_INFO("Total encoded bytes: {} ({} KB)", total_encoded_bytes, (total_encoded_bytes / 1024));
+    return 0;
+}
+
 }  // namespace
 
 int main() {
     // RunFfmpegPullerTest();
     // RunFfmpegPullerDecoderTest();
     // RunFfmpegConverterTest();
-    RunFfmpegPullerDecoderConverterEncoderTest();
+    RunFfmpegPullerDecoderConverterEncoderPushTest();
 }

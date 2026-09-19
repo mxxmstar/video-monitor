@@ -34,10 +34,10 @@ PusherResult Publisher::Open(const PublisherConfig& config) {
     // 当前注册表只包含 FFmpegFile。把类型检查保留在门面层，后续增加
     // RTSP Server 或其它 PublisherKind 时，可以在此创建不同的 Session，
     // 而不让上层调用方接触具体 Pusher 类型。
-    if (config.kind != PublisherKind::FFmpegFile) {
-        return PusherResult::Failed(MakeError(PusherErrorCategory::InvalidConfiguration,
-            "Publisher does not support the requested output kind"));
-    }
+    // if (config.kind != PublisherKind::FFmpegFile) {
+    //     return PusherResult::Failed(MakeError(PusherErrorCategory::InvalidConfiguration,
+    //         "Publisher does not support the requested output kind"));
+    // }
 
     return session_->Open(config.session);
 }

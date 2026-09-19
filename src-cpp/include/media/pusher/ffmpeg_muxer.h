@@ -4,6 +4,7 @@
 #include <chrono>
 #include <optional>
 #include <utility>
+#include <map>
 #include "media/media_packet.h"
 
 extern "C" {
@@ -19,6 +20,17 @@ struct MediaTrackConfig;
 struct MuxerIoOptions {
     std::chrono::milliseconds open_timeout{5000};
     std::chrono::milliseconds write_timeout{10000};
+};
+
+enum MuxerProtocol {
+    Rtmp,
+    Rtsp,    
+};
+
+struct MuxerOptions {
+    std::string protocol{};
+    /// @brief 配置 AVFormatContext 的参数，如MP4 的 movflags、RTSP 的 rtsp_transport、FLV 的 flvflags 等
+    std::map<std::string, std::string> extra_muxer_options;
 };
 
 /// @brief Muxer 选项
@@ -89,7 +101,7 @@ public:
     /// @param video_info 视频流信息
     /// @return Muxer 结果结构体
     MuxerResult Open(const std::string& output_url, const MediaTrackConfig& config,
-                     const MuxerIoOptions& io = {});
+                     const MuxerIoOptions& io = {}, const MuxerOptions& muxer_options = {});
 
     /// @brief 参数需由调用方校验；进入 FFmpeg 写入后 AVPacket 被消费，不能重用。
     MuxerResult Write(const MediaPacket& packet);
