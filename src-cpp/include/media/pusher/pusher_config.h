@@ -82,7 +82,5 @@ struct PusherConfig {
     MediaTrackConfig video_track;     ///< 已编码视频轨道的参数与时间基
     PusherIoConfig io;                ///< 0 禁用超时，负数无效
     FFmpegPusherConfig ffmpeg;        ///< FFmpeg 输出配置
-    std::optional<RtspOutputOptions> rtsp;
-    std::optional<RtmpOutputOptions> rtmp;
     bool is_valid() const;
 };

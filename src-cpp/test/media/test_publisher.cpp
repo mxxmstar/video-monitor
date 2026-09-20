@@ -25,7 +25,7 @@ PusherConfig MakeValidPusherConfig() {
 
 PublisherConfig MakeValidPublisherConfig() {
     PublisherConfig config;
-    config.kind = PublisherKind::FFmpegFile;
+    config.kind = PublisherKind::Client;
     config.session.pusher = MakeValidPusherConfig();
     return config;
 }

@@ -16,21 +16,21 @@ extern "C" {
 
 struct MediaTrackConfig;
 
-/// @brief Muxer I/O 选项
+/// @brief Muxer I/O 超时选项
 struct MuxerIoOptions {
     std::chrono::milliseconds open_timeout{5000};
     std::chrono::milliseconds write_timeout{10000};
 };
 
-enum MuxerProtocol {
-    Rtmp,
-    Rtsp,    
-};
-
-struct MuxerOptions {
-    std::string protocol{};
-    /// @brief 配置 AVFormatContext 的参数，如MP4 的 movflags、RTSP 的 rtsp_transport、FLV 的 flvflags 等
-    std::map<std::string, std::string> extra_muxer_options;
+/// @brief Muxer 打开选项
+/// @details 协议和格式选择由 Pusher负责。Muxer 将这些解析后的值传递给FFmpeg，并拥有FFmpeg资源。
+struct MuxerOpenOptions {
+    std::string output_url; ///< 输出 URL
+    std::string format_name; ///< 输出格式名称
+    MuxerIoOptions io; ///< I/O 超时选项
+    std::map<std::string, std::string> io_options;  ///< 给 avio_open2， 网络传输选项
+    std::map<std::string, std::string> muxer_options; ///< 给 avformat_write_header， 容器选项
+    bool normalize_timestamps{false};
 };
 
 /// @brief Muxer 选项
@@ -95,13 +95,8 @@ public:
     ~FFmpegMuxer();
     FFmpegMuxer(const FFmpegMuxer&) = delete;
     FFmpegMuxer& operator=(const FFmpegMuxer&) = delete;
-
-    /// @brief 打开muxer
-    /// @param output_url 输出URL
-    /// @param video_info 视频流信息
-    /// @return Muxer 结果结构体
-    MuxerResult Open(const std::string& output_url, const MediaTrackConfig& config,
-                     const MuxerIoOptions& io = {}, const MuxerOptions& muxer_options = {});
+    
+    MuxerResult Open(const MuxerOpenOptions& options, const MediaTrackConfig& config);
 
     /// @brief 参数需由调用方校验；进入 FFmpeg 写入后 AVPacket 被消费，不能重用。
     MuxerResult Write(const MediaPacket& packet);

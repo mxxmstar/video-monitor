@@ -25,6 +25,12 @@ bool IsFailure(const PusherResult& result, PusherErrorCategory expected) {
            result.error->category == expected;
 }
 
+MuxerOpenOptions MakeMuxerOpenOptions(const std::string& output_url) {
+    MuxerOpenOptions options;
+    options.output_url = output_url;
+    return options;
+}
+
 }  // namespace
 
 int main() {
@@ -82,7 +88,8 @@ int main() {
         return 1;
     }
     FFmpegMuxer muxer;
-    const auto muxer_error = muxer.Open("nonexistent-protocol://output.mp4",
+    const auto muxer_error = muxer.Open(
+        MakeMuxerOpenOptions("nonexistent-protocol://output.mp4"),
         MakeValidConfig("unused.mp4").video_track);
     if (muxer_error.Succeed() || muxer_error.error->operation != MuxerOperation::OpenIo ||
         muxer_error.error->native_code != AVERROR_PROTOCOL_NOT_FOUND || !muxer.Close().Succeed()) {
@@ -116,9 +123,58 @@ int main() {
         return 1;
     }
 
+    // 协议和 format 由 Pusher 解析，错误配置必须在创建 Muxer 或连接网络前
+    // 被拒绝，不能让下层根据 URL 猜测后继续执行。
+    PusherConfig empty_format = MakeValidConfig("unused.mp4");
+    empty_format.ffmpeg.output_format = std::string{};
+    if (!IsFailure(pusher.Open(empty_format),
+                   PusherErrorCategory::InvalidConfiguration)) {
+        std::cerr << "Explicit empty output format was accepted" << std::endl;
+        return 1;
+    }
+
+    PusherConfig mismatched_rtsp = MakeValidConfig("unused.mp4");
+    mismatched_rtsp.ffmpeg.rtsp = RtspOutputOptions{};
+    if (!IsFailure(pusher.Open(mismatched_rtsp),
+                   PusherErrorCategory::InvalidConfiguration)) {
+        std::cerr << "RTSP options were accepted for a file output" << std::endl;
+        return 1;
+    }
+
+    PusherConfig rtsp_with_io_options =
+        MakeValidConfig("rtsp://127.0.0.1/live/config-validation");
+    rtsp_with_io_options.ffmpeg.extra_io_options["tcp_nodelay"] = "1";
+    if (!IsFailure(pusher.Open(rtsp_with_io_options),
+                   PusherErrorCategory::InvalidConfiguration)) {
+        std::cerr << "RTSP AVIO options were accepted" << std::endl;
+        return 1;
+    }
+
     const std::filesystem::path output_path =
         std::filesystem::current_path() / "ffmpeg_pusher_lifecycle_test.mp4";
     std::error_code file_error;
+    std::filesystem::remove(output_path, file_error);
+
+    // FFmpeg leaves unrecognized options in the dictionary. They must become
+    // a configuration error instead of silently producing a partially
+    // configured output.
+    PusherConfig unknown_io_option = MakeValidConfig(output_path.string());
+    unknown_io_option.ffmpeg.extra_io_options["definitely_unknown_io_option"] = "1";
+    if (!IsFailure(pusher.Open(unknown_io_option),
+                   PusherErrorCategory::InvalidConfiguration) || pusher.IsOpen()) {
+        std::cerr << "Unknown AVIO option was accepted" << std::endl;
+        return 1;
+    }
+    std::filesystem::remove(output_path, file_error);
+
+    PusherConfig unknown_muxer_option = MakeValidConfig(output_path.string());
+    unknown_muxer_option.ffmpeg.extra_muxer_options[
+        "definitely_unknown_muxer_option"] = "1";
+    if (!IsFailure(pusher.Open(unknown_muxer_option),
+                   PusherErrorCategory::InvalidConfiguration) || pusher.IsOpen()) {
+        std::cerr << "Unknown muxer option was accepted" << std::endl;
+        return 1;
+    }
     std::filesystem::remove(output_path, file_error);
 
     if (!pusher.Open(MakeValidConfig(output_path.string())).Succeed() ||
@@ -154,7 +210,8 @@ int main() {
 
     std::filesystem::remove(output_path, file_error);
     // Cancellation must be checked before dereferencing a packet, even for local I/O.
-    if (!muxer.Open(output_path.string(), MakeValidConfig("unused.mp4").video_track).Succeed()) return 1;
+    if (!muxer.Open(MakeMuxerOpenOptions(output_path.string()),
+                    MakeValidConfig("unused.mp4").video_track).Succeed()) return 1;
     muxer.RequestStop();
     const auto cancelled = muxer.Write(MediaPacket{});
     if (cancelled.Succeed() || cancelled.error->category != MuxerErrorCategory::Cancelled ||
@@ -164,7 +221,8 @@ int main() {
         return 1;
     }
     muxer.Close();
-    if (!muxer.Open(output_path.string(), MakeValidConfig("unused.mp4").video_track).Succeed() ||
+    if (!muxer.Open(MakeMuxerOpenOptions(output_path.string()),
+                    MakeValidConfig("unused.mp4").video_track).Succeed() ||
         !muxer.Close().Succeed()) {
         std::cerr << "Reopen did not reset cancellation" << std::endl;
         return 1;

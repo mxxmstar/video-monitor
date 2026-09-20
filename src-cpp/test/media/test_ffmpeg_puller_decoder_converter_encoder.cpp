@@ -617,7 +617,7 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
     // Pusher 发生替换，调用方也不需要了解 FFmpegMuxer 的具体细节。
     const std::string output_file = "test.mp4";
     PublisherConfig publisher_config;
-    publisher_config.kind = PublisherKind::FFmpegFile;
+    publisher_config.kind = PublisherKind::Client;
     publisher_config.session.pusher.output_url = output_file;
     publisher_config.session.pusher.video_track = muxer_config;
     const PusherResult session_open_result = publisher.Open(publisher_config);
@@ -980,9 +980,11 @@ int RunFfmpegPullerDecoderConverterEncoderPushTest() {
     // Pusher 发生替换，调用方也不需要了解 FFmpegMuxer 的具体细节。
     const std::string output_file = kRtspPushOutputUrl;
     PublisherConfig publisher_config;
-    publisher_config.kind = PublisherKind::ZLMRTSP;
+    publisher_config.kind = PublisherKind::Client;
     publisher_config.session.pusher.output_url = output_file;
     publisher_config.session.pusher.video_track = muxer_config;
+    // Explicitly exercise the Pusher-owned RTSP option resolution path.
+    publisher_config.session.pusher.ffmpeg.rtsp = RtspOutputOptions{"tcp"};
     const PusherResult session_open_result = publisher.Open(publisher_config);
     if (!session_open_result.Succeed()) {
         LOG_ERROR("Failed to open publisher for {}: {}", output_file,
@@ -1117,8 +1119,18 @@ int RunFfmpegPullerDecoderConverterEncoderPushTest() {
     // 先 Flush 再 Close：Close 只释放 AVCodecContext，不会主动输出缓存帧。
     decoder.Close();
     encoder.Close();
-    publisher.Close();
+    const PusherResult publisher_close_result = publisher.Close();
     puller.Close();
+    if (!publisher_close_result.Succeed()) {
+        LOG_ERROR("Failed to close publisher for {}: {}", output_file,
+                  publisher_close_result.error.has_value()
+                      ? publisher_close_result.error->message : "unknown publisher error");
+        return 1;
+    }
+    if (muxed_packets == 0) {
+        LOG_ERROR("Publisher closed successfully but did not mux any packets");
+        return 1;
+    }
 
     // 成功结果只表达测试真正验证的条件：已经解码出目标数量的视频帧。
     // video_packet_count 是过程诊断数据，不能作为“10 帧必须来自 10 包”
@@ -1148,5 +1160,5 @@ int main() {
     // RunFfmpegPullerTest();
     // RunFfmpegPullerDecoderTest();
     // RunFfmpegConverterTest();
-    RunFfmpegPullerDecoderConverterEncoderPushTest();
+    return RunFfmpegPullerDecoderConverterEncoderPushTest();
 }

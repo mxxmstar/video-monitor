@@ -21,18 +21,6 @@ std::string AvErrorString(int ret) {
     return buf;
 }
 
-/// @brief 根据输出 URL 判断是否为本地文件。
-///
-/// 相对路径和绝对路径按文件处理；带网络协议的 URL 不做时间戳归零。
-bool IsFileOutputUrl(const std::string& url) {
-    const char* protocol = avio_find_protocol_name(url.c_str());
-    return protocol != nullptr && std::strcmp(protocol, "file") == 0;
-}
-
-bool IsRtspOutputUrl(const std::string& url) {
-    return url.find("rtsp") != std::string::npos;
-}
-
 }
 
 
@@ -46,31 +34,23 @@ FFmpegMuxer::~FFmpegMuxer() {
 
 
 
-MuxerResult FFmpegMuxer::Open(const std::string& output_url, const MediaTrackConfig& config, 
-    const MuxerIoOptions& io, const MuxerOptions& muxer_options) {
+MuxerResult FFmpegMuxer::Open(const MuxerOpenOptions& options,
+                              const MediaTrackConfig& config) {
     // Open 可以重复调用。先关闭旧的输出，保证旧的 AVIO 和 AVFormatContext
     // 不会泄漏，也避免新的 stream 挂到旧 context 上。
     const auto close_result = Close();
     if (!close_result.Succeed()) return close_result;
 
-    io_ = io;
+    io_ = options.io;
     interrupt_ctx_.stop_requested.store(false);
     interrupt_ctx_.timed_out.store(false);
-    output_url_ = output_url;
-    normalize_timestamps_ = IsFileOutputUrl(output_url_);
+    output_url_ = options.output_url;
+    normalize_timestamps_ = options.normalize_timestamps;
     timestamp_offset_set_ = false;
     timestamp_offset_ = 0;
 
-    // 分配 AVFormatContext
-    // 第三个参数 format_name：对于 RTSP/RTMP 等无扩展名的 URL，需要手动指定格式
-    const char* format_name = nullptr;
-    // RTSP/RTMP 是 AVFMT_NOFILE muxer，avio_find_protocol_name 检测不到，需要手动判断
-    if (IsRtspOutputUrl(output_url_)) {
-        format_name = "rtsp";
-    } else if (output_url_.rfind("rtmp://", 0) == 0 || output_url_.rfind("rtmps://", 0) == 0) {
-        format_name = "flv";
-    }
-    
+    const char* const format_name = options.format_name.empty()
+        ? nullptr : options.format_name.c_str();
     int ret = avformat_alloc_output_context2(&format_ctx_, nullptr, format_name, output_url_.c_str());
     if (ret < 0 || !format_ctx_) {
         LOG_ERROR("avformat_alloc_output_context2 failed: {}", AvErrorString(ret));
@@ -123,38 +103,75 @@ MuxerResult FFmpegMuxer::Open(const std::string& output_url, const MediaTrackCon
     };
     format_ctx_->interrupt_callback.opaque = &interrupt_ctx_;
 
+    AVDictionary* io_dict = nullptr;
+    AVDictionary* muxer_dict = nullptr;
+    const auto free_dicts = [&]() {
+        av_dict_free(&io_dict);
+        av_dict_free(&muxer_dict);
+    };
+    const auto populate_dict = [&](AVDictionary** dict, const std::map<std::string, std::string>& values, MuxerOperation operation) -> MuxerResult {
+        for (const auto& option : values) {
+            const int set_result = av_dict_set(dict, option.first.c_str(), option.second.c_str(), 0);
+            if (set_result < 0) {
+                return failure(operation, MuxerErrorCategory::OpenFailed, set_result);
+            }
+        }
+        return MuxerResult::Success();
+    };
+    const auto reject_unconsumed_options = [&](const AVDictionary* dict, MuxerOperation operation) -> MuxerResult {
+        const AVDictionaryEntry* const option = av_dict_get(dict, "", nullptr, AV_DICT_IGNORE_SUFFIX);
+        if (option == nullptr) return MuxerResult::Success();
+
+        LOG_ERROR("FFmpeg did not consume {} option: {}", operation == MuxerOperation::OpenIo ? "AVIO" : "muxer", option->key);
+        return failure(operation, MuxerErrorCategory::OpenFailed, AVERROR_OPTION_NOT_FOUND);
+    };
+
+    auto dictionary_result = populate_dict(&io_dict, options.io_options, MuxerOperation::OpenIo);
+    if (!dictionary_result.Succeed()) {
+        free_dicts();
+        Close();
+        return dictionary_result;
+    }
+    dictionary_result = populate_dict(&muxer_dict, options.muxer_options, MuxerOperation::WriteHeader);
+    if (!dictionary_result.Succeed()) {
+        free_dicts();
+        Close();
+        return dictionary_result;
+    }
+
     beginOperation(io_.open_timeout);
     if (!(format_ctx_->oformat->flags & AVFMT_NOFILE)) {
-        ret = avio_open2(&format_ctx_->pb, output_url_.c_str(), AVIO_FLAG_WRITE, &format_ctx_->interrupt_callback, nullptr);
+        ret = avio_open2(&format_ctx_->pb, output_url_.c_str(), AVIO_FLAG_WRITE, &format_ctx_->interrupt_callback, &io_dict);
         if (ret < 0) {
             auto result = failure(MuxerOperation::OpenIo, MuxerErrorCategory::OpenFailed, ret);
+            free_dicts();
             Close();
             return result;
         }
     }
-
-    AVDictionary* options = nullptr;
-
-    for (const auto& option : muxer_options.extra_muxer_options) {
-        ret = av_dict_set(&options, option.first.c_str(), option.second.c_str(), 0);
-        if (ret < 0) {
-            // auto result = failure(MuxerOperation::SetOption, MuxerErrorCategory::OpenFailed, ret);
-            // Close();
-            // return result;
-            LOG_WARN("av_dict_set option [{}, {}] failed: {}", option.first, option.second, AvErrorString(ret));
-        }
+    dictionary_result = reject_unconsumed_options(io_dict, MuxerOperation::OpenIo);
+    if (!dictionary_result.Succeed()) {
+        free_dicts();
+        Close();
+        return dictionary_result;
     }
 
-
     // 打开过程包括由 write_header（例如 RTSP）执行的协议协商。
-    ret = avformat_write_header(format_ctx_, nullptr);
+    ret = avformat_write_header(format_ctx_, &muxer_dict);
     if (ret < 0) {
         auto result = failure(MuxerOperation::WriteHeader, MuxerErrorCategory::OpenFailed, ret);
+        free_dicts();
         Close();
         return result;
     }
     header_written_ = true;
-
+    dictionary_result = reject_unconsumed_options(muxer_dict, MuxerOperation::WriteHeader);
+    if (!dictionary_result.Succeed()) {
+        free_dicts();
+        Close();
+        return dictionary_result;
+    }
+    free_dicts();
     LOG_INFO("Muxer Opend: {}", output_url_);
     LOG_INFO("Video Config: {}x{} {}fps", video_config.width, video_config.height, video_config.fps);
     return MuxerResult::Success();

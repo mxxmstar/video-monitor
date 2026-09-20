@@ -1,6 +1,8 @@
 #include "media/pusher/ffmpeg_pusher.h"
 
+#include <algorithm>
 #include <cerrno>
+#include <cctype>
 #include <cstring>
 #include <utility>
 
@@ -9,6 +11,36 @@ namespace {
 /// @brief 统一构造 Pusher 失败结果，避免每个分支遗漏错误分类。
 PusherResult MakeFailure(PusherErrorCategory category, std::string message, bool retryable = false) {
     return PusherResult::Failed(PusherError{category, std::move(message), retryable});
+}
+
+std::string ToLowerAscii(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value;
+}
+
+std::optional<std::string> UrlScheme(const std::string& url) {
+    const auto colon = url.find(':');
+    if (colon == std::string::npos || colon == 0) return std::nullopt;
+
+    // A Windows drive path is a local file, not a one-character URI scheme.
+    if (colon == 1 && std::isalpha(static_cast<unsigned char>(url[0])) &&
+        url.size() > 2 && (url[2] == '\\' || url[2] == '/')) {
+        return std::nullopt;
+    }
+
+    if (!std::isalpha(static_cast<unsigned char>(url[0]))) return std::nullopt;
+    for (std::size_t index = 1; index < colon; ++index) {
+        const unsigned char c = static_cast<unsigned char>(url[index]);
+        if (!std::isalnum(c) && c != '+' && c != '-' && c != '.') return std::nullopt;
+    }
+    return ToLowerAscii(url.substr(0, colon));
+}
+
+bool IsLocalFileOutput(const std::string& output_url) {
+    const auto scheme = UrlScheme(output_url);
+    return !scheme.has_value() || *scheme == "file";
 }
 
 bool IsNetworkOutput(const std::string& output_url) {
@@ -23,6 +55,120 @@ bool IsNetworkOutput(const std::string& output_url) {
         network_output = true;
     }
     return network_output;
+}
+
+bool IsRtspScheme(const std::optional<std::string>& scheme) {
+    return scheme.has_value() && (*scheme == "rtsp" || *scheme == "rtsps");
+}
+
+bool IsRtmpScheme(const std::optional<std::string>& scheme) {
+    return scheme.has_value() && (*scheme == "rtmp" || *scheme == "rtmps");
+}
+
+/// @brief 添加 FFmpeg 输出选项
+/// @details 会检查选项是否已存在，避免重复添加。
+/// @param options 输出选项映射
+/// @param name 选项名称
+/// @param value 选项值
+/// @param error 输出错误结果
+/// @return 是否成功添加选项
+bool AddOption(std::map<std::string, std::string>& options, const std::string& name,
+               const std::string& value, PusherResult& error) {
+    if (options.find(name) != options.end()) {
+        error = MakeFailure(PusherErrorCategory::InvalidConfiguration,
+                            "Conflicting FFmpeg output option: " + name);
+        return false;
+    }
+    options.emplace(name, value);
+    return true;
+}
+
+struct ResolvedMuxerOutput {
+    MuxerOpenOptions options;
+    bool network_output{false};
+};
+
+std::optional<ResolvedMuxerOutput> ResolveMuxerOutput(const PusherConfig& config,
+                                                       PusherResult& error) {
+    const auto scheme = UrlScheme(config.output_url);
+    const bool is_rtsp = IsRtspScheme(scheme);
+    const bool is_rtmp = IsRtmpScheme(scheme);
+
+    if (config.ffmpeg.rtsp.has_value() && (!is_rtsp)) {
+        error = MakeFailure(PusherErrorCategory::InvalidConfiguration,
+                            "Output URL mismatch with output rtsp options");
+        return std::nullopt;
+    }
+    if (config.ffmpeg.rtmp.has_value() && (!is_rtmp)) {
+        error = MakeFailure(PusherErrorCategory::InvalidConfiguration,
+                            "Output URL mismatch with output rtmp options");
+        return std::nullopt;
+    }
+    if (is_rtsp && !config.ffmpeg.extra_io_options.empty()) {
+        error = MakeFailure(PusherErrorCategory::InvalidConfiguration,
+                            "RTSP output does not accept AVIO output options");
+        return std::nullopt;
+    }
+
+    ResolvedMuxerOutput resolved;
+    resolved.options.output_url = config.output_url;
+    resolved.options.io = {config.io.connect_timeout, config.io.write_timeout};
+    resolved.options.normalize_timestamps = IsLocalFileOutput(config.output_url);
+    resolved.network_output = IsNetworkOutput(config.output_url);
+
+    if (config.ffmpeg.output_format.has_value()) {
+        if (config.ffmpeg.output_format->empty()) {
+            error = MakeFailure(PusherErrorCategory::InvalidConfiguration,
+                                "FFmpeg output_format cannot be empty when specified");
+            return std::nullopt;
+        }
+        resolved.options.format_name = ToLowerAscii(*config.ffmpeg.output_format);
+    } else if (is_rtsp) {
+        resolved.options.format_name = "rtsp";
+    } else if (is_rtmp) {
+        resolved.options.format_name = "flv";
+    }
+
+    const std::string required_format = is_rtsp ? "rtsp" : (is_rtmp ? "flv" : "");
+    if (!required_format.empty() && !resolved.options.format_name.empty() &&
+        resolved.options.format_name != required_format) {
+        error = MakeFailure(PusherErrorCategory::InvalidConfiguration,
+                            "The selected output format is incompatible with the output URL");
+        return std::nullopt;
+    }
+
+    resolved.options.io_options = config.ffmpeg.extra_io_options;
+    resolved.options.muxer_options = config.ffmpeg.extra_muxer_options;
+
+    if (config.ffmpeg.rtsp.has_value()) {
+        const std::string transport = ToLowerAscii(config.ffmpeg.rtsp->transport);
+        if (transport != "tcp" && transport != "udp") {
+            error = MakeFailure(PusherErrorCategory::InvalidConfiguration,
+                                "RTSP transport must be tcp or udp");
+            return std::nullopt;
+        }
+        if (!AddOption(resolved.options.muxer_options, "rtsp_transport", transport, error)) {
+            return std::nullopt;
+        }
+    }
+
+    if (config.ffmpeg.rtmp.has_value()) {
+        const RtmpOutputOptions& rtmp = *config.ffmpeg.rtmp;
+        if (rtmp.app.has_value() &&
+            !AddOption(resolved.options.io_options, "rtmp_app", *rtmp.app, error)) {
+            return std::nullopt;
+        }
+        if (rtmp.playpath.has_value() &&
+            !AddOption(resolved.options.io_options, "rtmp_playpath", *rtmp.playpath, error)) {
+            return std::nullopt;
+        }
+        if (rtmp.tcp_nodelay.has_value() &&
+            !AddOption(resolved.options.io_options, "tcp_nodelay", *rtmp.tcp_nodelay ? "1" : "0", error)) {
+            return std::nullopt;
+        }
+    }
+
+    return resolved;
 }
 
 }  // namespace
@@ -66,6 +212,7 @@ PusherResult MapMuxerError(const MuxerError& error, bool network_output) {
     } else if (code == AVERROR_MUXER_NOT_FOUND) {
         category = Category::UnsupportedMedia;
     } else if ((code == AVERROR(EINVAL) || code == AVERROR_INVALIDDATA ||
+                code == AVERROR_OPTION_NOT_FOUND ||
                 code == AVERROR_HTTP_BAD_REQUEST || code == AVERROR_HTTP_OTHER_4XX) &&
                category == Category::OpenFailed) {
         category = Category::InvalidConfiguration;
@@ -109,22 +256,12 @@ PusherResult FFmpegPusher::Open(const PusherConfig& config) {
                            "FFmpegPusher currently supports H264 video only");
     }
 
-    network_output_ = IsNetworkOutput(config.output_url);
-    MuxerOptions muxer_op = {};
-    if (config.ffmpeg.rtsp.has_value()) {
-        muxer_op.protocol = "rtsp";
-        muxer_op.extra_muxer_options["transport"] = config.ffmpeg.rtsp->transport;
-    } else if (config.ffmpeg.rtmp.has_value()) {
-        // muxer_op["app"] = config.ffmpeg.rtmp->app;
-        // muxer_op["playpath"] = config.ffmpeg.rtmp->playpath;
-        // muxer_op["tcp_nodelay"] = config.ffmpeg.rtmp->tcp_nodelay;
-    }
+    PusherResult resolve_error;
+    const auto resolved_output = ResolveMuxerOutput(config, resolve_error);
+    if (!resolved_output.has_value()) return resolve_error;
 
-    for (const auto& option : config.ffmpeg.extra_muxer_options) {
-        muxer_op.extra_muxer_options[option.first] = option.second;
-    }
-    MuxerResult muxer_result = muxer_.Open(config.output_url, config.video_track,
-        MuxerIoOptions{config.io.connect_timeout, config.io.write_timeout}, muxer_op);
+    network_output_ = resolved_output->network_output;
+    MuxerResult muxer_result = muxer_.Open(resolved_output->options, config.video_track);
     if (!muxer_result.Succeed()) {
         return MapMuxerError(*muxer_result.error, network_output_);
     }
