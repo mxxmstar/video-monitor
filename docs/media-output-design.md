@@ -353,13 +353,14 @@ Publisher 负责：
 第一版只注册：
 
 ```text
-PublisherKind::FFmpegFile
+PublisherKind::Client
 ```
 
-当前枚举名 `FFmpegFile` 只是第一版以 MP4 文件为目标的历史命名。等
-FFmpegPusher 验证网络输出后，如果同一个实现需要同时表示文件和网络目标，
-可以将其改名为更准确的 `FFmpegOutput`；这只是配置命名调整，不意味着要
-增加多个协议 Pusher。
+`Client` 与 `Server` 表示不同的交互模型，而不是 FFmpeg、MP4、RTSP 或
+ZLMediaKit 的名称。第一版 Client 路线使用 `FFmpegPusher`，它既可以输出
+本地文件，也可以主动推送到 FFmpeg 支持的网络目标。未来增加非 FFmpeg 的
+Client 后端时，新增 `IPusher` 实现；未来实现监听和多客户端分发时，使用
+`PublisherKind::Server` 的独立 Server/Protocol/ClientSession 路线。
 
 不要在这一阶段加入 RTSP Server、WebRTC 或 RTP UDP。RTSP Server 属于后续
 PullServer 路线，不是当前 FFmpeg PushClient 的下一种 URL 配置。
@@ -599,6 +600,7 @@ struct MuxerOpenOptions {
     MuxerIoOptions io;
     std::map<std::string, std::string> io_options;
     std::map<std::string, std::string> muxer_options;
+    bool normalize_timestamps;
 };
 
 // Shared MediaTrackConfig is independent of PusherConfig.
@@ -689,8 +691,8 @@ ZLMediaKit 是远端服务，不作为 Pusher 的新后端类型。
    覆盖 Windows 路径、大小写协议、无扩展名、显式格式、负超时及错误选项。
 3. Muxer 接入：显式指定格式，分别传入 AVIO/muxer 字典；验证失败清理、
    未消费选项、超时和取消仍保留原始阶段。
-4. Publisher 命名：将 FFmpegFile 迁移为 FFmpegOutput，按需要保留旧名兼容；
-   不按 RTSP/RTMP 增加 Publisher 分支。
+4. Publisher 路线：保持 `Client/Server` 两种交互模型；Client 内按后端创建
+   Pusher，不按 RTSP/RTMP/ZLMediaKit 增加 Publisher 分支。
 5. 回归与联调：先通过本地 MP4、时间戳和 Session 测试，再分别验证 ZLMediaKit
    RTSP/TCP、RTMP 的单路 H.264 发布与播放；加入连接拒绝、认证拒绝、
    服务端断开以及可控本地测试服务制造的超时测试。
@@ -701,3 +703,79 @@ ZLMediaKit 是远端服务，不作为 Pusher 的新后端类型。
 max_reconnect_attempts、initial_delay、max_delay 和 backoff_multiplier。
 消费式写包失败后不重发原包；重连成功后等待新关键帧。
 重连机制不能替代本阶段的格式、选项和媒体参数校验。
+
+## 9. 边界收敛项（2026-09-19 追加）
+
+本节固化网络推流基线之后的接口约束。以下工作不改变 PushClient 与
+PullServer 的分界：`PublisherKind::Client` 继续表示主动向单一目标输出，
+`PublisherKind::Server` 留给后续监听端口和服务多个播放客户端的独立路线。
+ZLMediaKit 是 Client 的远端目标，不是新的 Publisher 类型。
+
+### 9.1 时间轴策略归属 PusherSession
+
+时间轴的起点和恢复策略属于一次输出会话，必须由 `PusherSession` 决定：
+
+- Session 配置显式选择 `Preserve` 或 `StartAtZero`；
+- Session 在首个被接纳的媒体包建立 epoch，并在重连成功后按配置重建；
+- Session 不改写 Puller、Decoder 或 Encoder 的原始时间轴；
+- Pusher 只将 Session 给出的 packet 时间戳交给输出后端；Muxer 只负责按
+  输出流 time base 转换并写入。
+
+现阶段本地文件的时间戳归零仍是过渡行为，已由 `FFmpegPusher` 根据输出类型
+转为传给 Muxer 的显式执行参数。迁移时让 Session 生成该参数，再删除 Pusher
+基于 URL 的本地文件判断。网络输出默认保留连续时间轴，避免重连或多个输出
+目标各自猜测偏移量。
+
+### 9.2 停止、事件与并发契约
+
+在引入重连或异步队列前，先固定两类操作：
+
+| 操作 | 契约 | 责任路径 |
+|---|---|---|
+| `RequestStop()` | 线程安全、非阻塞、可重复；只请求中断阻塞 I/O 或退避等待 | `Publisher -> PusherSession -> IPusher -> Muxer` |
+| `Close()` | 在停止后等待当前 I/O 退出，写 trailer、释放资源并返回最终结果 | `Publisher -> PusherSession -> IPusher -> Muxer` |
+
+`IPusher` 应将停止作为虚接口，而不是仅由 `FFmpegPusher` 暴露。Pusher 的异步
+事件也必须使用结构化事件（至少包含错误、发生阶段和是否可重试），由
+`PusherSession` 串行处理状态迁移和重连。不能让 Pusher 回调直接改 Publisher
+状态，也不能用字符串回调让 Session 解析 FFmpeg 错误文本。
+
+当前同步 `Publish()` 明确会把网络写入背压传给调用线程。以后若增加队列，队列
+归 Session 所有，需在配置中定义容量、满队列策略、停止时丢弃规则和统计口径；
+Publisher 只暴露结果和控制入口。
+
+### 9.3 Packet 所有权与重试
+
+当前 FFmpeg Muxer 使用消费式写入：一旦进入
+`av_interleaved_write_frame()`，底层 `AVPacket` 不可由调用方重试或复用。
+这个约束必须体现在接口中，不能只依赖 `const MediaPacket&` 注释表达。
+
+- 保持消费式模型时，`Push/Write` 应接收可移动或可变的 packet，并在结果中
+  明确标记是否已消费；
+- 改为非消费式模型时，Pusher 或 Session 必须通过 `av_packet_ref()` 创建自己
+  的引用，原 packet 才能用于重试或异步队列；
+- 首版重连默认丢弃失败包，关闭旧 Pusher 后等待新的关键帧；不得隐式重发；
+- 引入音频或多轨前，需单独定义关键帧门控期间音频的缓存/丢弃策略和各轨
+  所有权，不能沿用单视频规则。
+
+### 9.4 统计、健康状态与联调验收
+
+统计按拥有信息的层采集，避免 Publisher 从日志或 FFmpeg 错误文本反推：
+
+| 层 | 必须提供的统计/状态 |
+|---|---|
+| Muxer | 实际写入包数/字节数、写入与关闭失败的 native code 和操作阶段 |
+| Pusher | 已映射错误分类、目标可达性、协议/format 及后端打开状态 |
+| PusherSession | 等待关键帧丢弃数、实际发布数、重连次数/退避状态、当前会话状态 |
+| Publisher | 对外汇总状态、最后错误、每个输出目标的 Session 统计 |
+
+`RunFfmpegPullerDecoderConverterEncoderPushTest` 的成功条件还应包括：
+
+1. `publisher.Close()` 成功，不能忽略 trailer 或连接关闭失败；
+2. ZLMediaKit 已注册预期媒体流，并由独立播放端拉流并完成解码；
+3. 首帧为可解码关键帧，随后 PTS/DTS 连续且单调；
+4. 主动断开 ZLMediaKit、认证拒绝、连接超时和停止阻塞写入都得到预期状态；
+5. 测试结束后确认服务端流和本地 FFmpeg 资源均已释放。
+
+离线单测继续覆盖格式解析、option 映射、消费语义、状态机和重连退避；真实
+ZLMediaKit 联调只验证网络兼容性，不能替代这些可重复的回归测试。
