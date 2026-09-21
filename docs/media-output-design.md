@@ -600,7 +600,6 @@ struct MuxerOpenOptions {
     MuxerIoOptions io;
     std::map<std::string, std::string> io_options;
     std::map<std::string, std::string> muxer_options;
-    bool normalize_timestamps;
 };
 
 // Shared MediaTrackConfig is independent of PusherConfig.
@@ -715,16 +714,21 @@ ZLMediaKit 是 Client 的远端目标，不是新的 Publisher 类型。
 
 时间轴的起点和恢复策略属于一次输出会话，必须由 `PusherSession` 决定：
 
-- Session 配置显式选择 `Preserve` 或 `StartAtZero`；
-- Session 在首个被接纳的媒体包建立 epoch，并在重连成功后按配置重建；
+- Session 配置显式选择 `Preserved` 或 `StartAtZero`；
+- Session 在首个被接纳的媒体包建立 epoch；
 - Session 不改写 Puller、Decoder 或 Encoder 的原始时间轴；
-- Pusher 只将 Session 给出的 packet 时间戳交给输出后端；Muxer 只负责按
-  输出流 time base 转换并写入。
+- Session 复制被接纳的 packet 并按策略改写副本的有效 PTS/DTS；Pusher 只将
+  该副本交给输出后端；Muxer 只负责按输出流 time base 转换并写入。
 
-现阶段本地文件的时间戳归零仍是过渡行为，已由 `FFmpegPusher` 根据输出类型
-转为传给 Muxer 的显式执行参数。迁移时让 Session 生成该参数，再删除 Pusher
-基于 URL 的本地文件判断。网络输出默认保留连续时间轴，避免重连或多个输出
-目标各自猜测偏移量。
+当前 `PusherTimestampPolicy` 默认 `Preserved`；需要文件从零开始时，调用方显式
+设置 `StartAtZero`。Session 以首个被关键帧门控接纳的 packet 中较早的
+PTS/DTS 建立 epoch，并要求该策略下的 packet 使用输出轨道声明的时间基，避免
+不同刻度的整数 timestamp 被静默相减。网络输出默认保留连续时间轴，避免重连
+或多个输出目标各自猜测偏移量。
+
+当前尚未实现自动重连；`TimestampEpochScope` 仅预留重连加入后的 epoch
+生命周期：`Session` 沿用 epoch，`Connection` 在新连接的首包重新建立 epoch。
+当前 `Open()` 与成功的 `Close()` 都会清除 epoch。
 
 ### 9.2 停止、事件与并发契约
 

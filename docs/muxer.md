@@ -336,40 +336,32 @@ RTSP 等实时流可能已经运行很久，编码 packet 的首个 `PTS/DTS` �
 
 #### 修复
 
-`Open()` 根据 `output_url` 判断输出类型：
+时间轴策略不属于 `FFmpegMuxer`。`PusherSessionConfig` 显式选择
+`PusherTimestampMode::Preserved` 或 `PusherTimestampMode::StartAtZero`；默认保留上游
+时间轴。需要文件从零开始的调用方必须选择 `StartAtZero`，不能通过 URL 或
+Muxer 隐式推断。
 
-```cpp
-const char* protocol = avio_find_protocol_name(output_url.c_str());
-normalize_timestamps_ =
-    protocol != nullptr && std::strcmp(protocol, "file") == 0;
-```
-
-FFmpeg 的协议识别可以同时覆盖普通相对路径、绝对路径、Windows 盘符路径和
-`file:` URL。RTSP 等网络输出不会启用归零。
-
-本地文件写包流程调整为：
+`StartAtZero` 的 Session 写包流程为：
 
 ```text
-1. 将 packet 的 pts/dts/duration 重标定到 AVStream::time_base
-2. 读取第一包中有效的 pts 和 dts
+1. 在关键帧门控后接纳首个 packet
+2. 读取该 packet 中有效的 pts 和 dts
 3. 取两者中的最早值作为 timestamp_offset
-4. 第一包及所有后续包的有效 pts/dts 统一减去 timestamp_offset
-5. duration 只做时间基换算，不减偏移量
+4. 复制 packet，在副本中将第一包及所有后续包的有效 pts/dts 减去 offset
+5. 将副本交给 Pusher；Muxer 仅将 pts/dts/duration 重标定到 AVStream::time_base
 ```
 
-偏移量保存在输出流时间基中。这样即使后续 packet 的输入 `time_base` 不同，
-归零操作仍然使用同一刻度。
-
-如果第一包的 `PTS/DTS` 都无效，偏移量固定为 0，后续包不能再重新设置偏移，
-避免写到一半突然改变时间轴。`Open()` 和 `Close()` 都会重置归零状态，保证
-重复打开 muxer 时不会沿用上一个文件的偏移量。
+epoch 保存在 Session 的轨道时间基下。当前单轨实现要求 `StartAtZero` 的所有
+packet 与输出轨道使用等值时间基；第一包 PTS/DTS 都无效或时间基不一致时返回
+`InvalidPacket`，不会猜测 offset 或调用 Pusher。`Open()` 和 `Close()` 重置
+Session 的 epoch，保证新会话不会沿用上一个输出的偏移量。
 
 ### 11.3 文件与网络输出行为
 
 | 输出类型 | 示例 | 首包偏移 | 后续包处理 |
 | --- | --- | --- | --- |
-| 本地文件 | `output.mp4`、`C:\video\output.mp4`、`file:output.mp4` | 第一包最早有效 `PTS/DTS` | 有效 `PTS/DTS` 统一减去偏移 |
-| 网络输出 | `rtsp://host/live/test`、`rtmp://host/live/test` | 不记录 | 仅重标定时间基，不归零 |
+| `StartAtZero` | 常用于本地文件 | 首个接纳包最早有效 `PTS/DTS` | 有效 `PTS/DTS` 统一减去偏移 |
+| `Preserved` | RTSP/RTMP 等实时输出的默认策略 | 不记录 | 仅重标定时间基，不归零 |
 
 无论输出类型如何，`duration` 都只通过 `av_packet_rescale_ts()` 换算到输出流
 时间基，不参与起始时间偏移。
@@ -380,5 +372,5 @@ FFmpeg 的协议识别可以同时覆盖普通相对路径、绝对路径、Wind
 
 - 编码器将 `1,000,000 us` 的 `pts` 正确换算为 `1/25` 时间基下的 25 tick。
 - 编码器将 `40,000 us` 的 `duration` 正确换算为 1 tick。
-- 使用非零起点编码三个 packet 后写入本地 MP4。
+- 使用非零起点编码三个 packet，并显式配置 `StartAtZero` 后写入本地 MP4。
 - 重新读取 MP4，验证三个 packet 从 0 开始且保持连续的相对时间轴。
