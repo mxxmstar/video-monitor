@@ -45,9 +45,6 @@ MuxerResult FFmpegMuxer::Open(const MuxerOpenOptions& options,
     interrupt_ctx_.stop_requested.store(false);
     interrupt_ctx_.timed_out.store(false);
     output_url_ = options.output_url;
-    normalize_timestamps_ = options.normalize_timestamps;
-    timestamp_offset_set_ = false;
-    timestamp_offset_ = 0;
 
     const char* const format_name = options.format_name.empty()
         ? nullptr : options.format_name.c_str();
@@ -203,9 +200,6 @@ MuxerResult FFmpegMuxer::Close() {
 
     video_stream_ = nullptr;
     header_written_ = false;
-    normalize_timestamps_ = false;
-    timestamp_offset_set_ = false;
-    timestamp_offset_ = 0;
     output_url_.clear();
     return result;
 }
@@ -247,36 +241,6 @@ MuxerResult FFmpegMuxer::Write(const MediaPacket& packet) {
     //
     // 例如源为 1/25、pts=1，目标为 1/90000，则结果为 3600。
     av_packet_rescale_ts(av_packet, AVRational{packet.time_base.num, packet.time_base.den}, video_stream_->time_base);
-
-    if (normalize_timestamps_) {
-        // 偏移量保存在输出流时间基中，后续包即使使用不同的输入时间基，
-        // 也能在统一刻度下归零。只使用第一包决定偏移；若它没有有效
-        // PTS/DTS，则偏移保持为 0，不能在后续包中途改变时间轴。
-        if (!timestamp_offset_set_) {
-            timestamp_offset_ = 0;
-            // 拿到第一个有效的 PTS，使用它作为偏移量
-            // I P帧的PTS >= DTS
-            if (av_packet->pts != AV_NOPTS_VALUE) {
-                timestamp_offset_ = av_packet->pts;
-            }
-            if (av_packet->dts != AV_NOPTS_VALUE &&
-                (av_packet->pts == AV_NOPTS_VALUE || av_packet->dts < timestamp_offset_)) {
-                timestamp_offset_ = av_packet->dts;
-            }
-            timestamp_offset_set_ = true;
-
-            if (av_packet->pts != AV_NOPTS_VALUE || av_packet->dts != AV_NOPTS_VALUE) {
-                LOG_INFO("FFmpegMuxer normalizes local-file timestamps by {} stream tick(s)", timestamp_offset_);
-            }
-        }
-
-        if (av_packet->pts != AV_NOPTS_VALUE) {
-            av_packet->pts -= timestamp_offset_;
-        }
-        if (av_packet->dts != AV_NOPTS_VALUE) {
-            av_packet->dts -= timestamp_offset_;
-        }
-    }
 
     beginOperation(io_.write_timeout);
     const int ret = av_interleaved_write_frame(format_ctx_, av_packet);

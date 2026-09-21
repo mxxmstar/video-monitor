@@ -5,6 +5,21 @@
 
 #include "media/pusher/i_pusher.h"
 
+enum class PusherTimestampMode {
+    Preserved, ///< 保留编码器输出的视频源原始时间戳，不进行转换
+    StartAtZero, ///< 转换为推流器从零开始的时间戳，从第一个被接纳的关键帧开始计时
+};
+
+enum class PusherTimestampEpochScope {
+    Session,     ///< 自动重连后沿用本次会话中的原 epoch，保持逻辑时间连续
+    Connection,  ///< 自动重连后推流器以新连接的首包重新建立 epoch，即时间轴从零开始计时
+};
+
+struct PusherTimestampPolicy {
+    PusherTimestampMode mode{PusherTimestampMode::Preserved};
+    PusherTimestampEpochScope scope{PusherTimestampEpochScope::Session};
+};
+
 /// @brief 一次输出会话的状态。
 ///
 /// 初版只有同步写入，因此不引入 Opening、Stopping 等瞬时状态。后续加入
@@ -18,10 +33,11 @@ enum class PusherSessionState {
 
 /// @brief PusherSession 的配置入口。
 ///
-/// 当前只包含具体 Pusher 的输出配置。单独保留这一层，是为了将来把重连、
-/// 时间轴和关键帧策略配置加入 Session 时不修改 Open() 的参数类型。
+/// 时间轴、关键帧门控和重连属于 Session；具体协议、封装格式及 FFmpeg 参数
+/// 仍由 PusherConfig 持有。
 struct PusherSessionConfig {
     PusherConfig pusher;
+    PusherTimestampPolicy timestamp_policy;
 
     bool is_valid() const { return pusher.is_valid(); }
 };
@@ -79,9 +95,10 @@ struct PusherPublishResult {
 /// 目前只做了：
 /// 1. 成功 Open 后等待关键帧；
 /// 2. 丢弃等待期间的非关键视频包；
-/// 3. 首个关键帧成功写入后进入 Running；
-/// 4. 底层写入失败后停止继续写入。
-/// 待实现：自动重连、退避、时间轴变换和多轨同步。
+/// 3. 按时间轴策略保留时间戳或从首个接纳包建立 epoch；
+/// 4. 首个关键帧成功写入后进入 Running；
+/// 5. 底层写入失败后停止继续写入。
+/// 待实现：自动重连、退避和多轨同步。
 class PusherSession {
 public:
     /// @brief 创建默认使用 FFmpegPusher 的输出会话。
@@ -108,8 +125,14 @@ public:
 
 private:
     PusherPublishResult forwardAcceptedPacket(const MediaPacket& packet);
+    PusherResult applyPusherTimestampPolicy(MediaPacket& packet);
     static PusherError MakeError(PusherErrorCategory category, const char* message);
 
     std::unique_ptr<IPusher> pusher_;
     PusherSessionState state_{PusherSessionState::Closed};
+    PusherTimestampPolicy timestamp_policy_{};
+    /// @brief 时间戳基准点，用于后续包的时间戳归一化或偏移计算
+    std::optional<std::int64_t> timestamp_epoch_;
+    /// @brief 时间戳时间基，用于后续包的时间戳单位转换
+    std::optional<Rational> timestamp_time_base_;
 };

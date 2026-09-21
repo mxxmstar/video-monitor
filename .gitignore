@@ -41,3 +41,6 @@ build-vs/*
 build-ninja*/*
 .vs/*
 .vscode/*
+
+*.ts
+*.m3u8

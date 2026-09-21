@@ -38,11 +38,6 @@ std::optional<std::string> UrlScheme(const std::string& url) {
     return ToLowerAscii(url.substr(0, colon));
 }
 
-bool IsLocalFileOutput(const std::string& output_url) {
-    const auto scheme = UrlScheme(output_url);
-    return !scheme.has_value() || *scheme == "file";
-}
-
 bool IsNetworkOutput(const std::string& output_url) {
     const char* protocol = avio_find_protocol_name(output_url.c_str());
     bool network_output = false;
@@ -113,7 +108,6 @@ std::optional<ResolvedMuxerOutput> ResolveMuxerOutput(const PusherConfig& config
     ResolvedMuxerOutput resolved;
     resolved.options.output_url = config.output_url;
     resolved.options.io = {config.io.connect_timeout, config.io.write_timeout};
-    resolved.options.normalize_timestamps = IsLocalFileOutput(config.output_url);
     resolved.network_output = IsNetworkOutput(config.output_url);
 
     if (config.ffmpeg.output_format.has_value()) {

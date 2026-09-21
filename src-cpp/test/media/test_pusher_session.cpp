@@ -2,6 +2,7 @@
 
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -29,6 +30,7 @@ MediaPacket MakeVideoPacket(bool keyframe) {
     packet.type = MediaType::VIDEO;
     packet.codec = CodecType::H264;
     packet.keyframe = keyframe;
+    packet.time_base = {1, 25};
     return packet;
 }
 
@@ -52,6 +54,7 @@ public:
     PusherResult Push(const MediaPacket& packet) override {
         ++push_calls;
         last_packet_was_keyframe = packet.keyframe;
+        last_packet = packet;
         if (!opened) {
             return PusherResult::Failed(MakeError(
                 PusherErrorCategory::InvalidState,
@@ -85,6 +88,7 @@ public:
     bool opened{false};
     bool fail_next_push{false};
     bool last_packet_was_keyframe{false};
+    std::optional<MediaPacket> last_packet;
     std::optional<PusherError> next_error;
 };
 
@@ -129,10 +133,17 @@ int main() {
     }
 
     // 第一个关键帧必须真正交给 Pusher；只有成功后状态才进入 Running。
-    const PusherPublishResult first_keyframe = session.Publish(MakeVideoPacket(true));
+    MediaPacket first_keyframe_packet = MakeVideoPacket(true);
+    first_keyframe_packet.pts = 120;
+    first_keyframe_packet.dts = 118;
+    first_keyframe_packet.duration = 2;
+    const PusherPublishResult first_keyframe = session.Publish(first_keyframe_packet);
     if (!first_keyframe.Succeed() || !first_keyframe.WasPublished() ||
         session.State() != PusherSessionState::Running ||
-        scripted->push_calls != 1 || !scripted->last_packet_was_keyframe) {
+        scripted->push_calls != 1 || !scripted->last_packet_was_keyframe ||
+        !scripted->last_packet.has_value() ||
+        scripted->last_packet->pts != first_keyframe_packet.pts ||
+        scripted->last_packet->dts != first_keyframe_packet.dts) {
         std::cerr << "First keyframe did not start the session" << std::endl;
         return 1;
     }
@@ -151,6 +162,99 @@ int main() {
         std::cerr << "Session Close is not idempotent" << std::endl;
         return 1;
     }
+
+    // StartAtZero 由 Session 处理而不是 Muxer 处理。首个被接纳的关键帧
+    // 使用最早的 DTS/PTS 建立 epoch；上游 packet 本身不能被改写。
+    PusherSessionConfig zero_based_config = config;
+    zero_based_config.timestamp_policy.mode = PusherTimestampMode::StartAtZero;
+    if (!session.Open(zero_based_config).Succeed()) {
+        std::cerr << "Failed to open zero-based session" << std::endl;
+        return 1;
+    }
+    MediaPacket zero_based_first = MakeVideoPacket(true);
+    zero_based_first.pts = 120;
+    zero_based_first.dts = 118;
+    zero_based_first.duration = 2;
+    if (!session.Publish(zero_based_first).WasPublished() ||
+        !scripted->last_packet.has_value() || scripted->last_packet->pts != 2 ||
+        scripted->last_packet->dts != 0 || scripted->last_packet->duration != 2 ||
+        zero_based_first.pts != 120 || zero_based_first.dts != 118) {
+        std::cerr << "Session did not normalize the first packet without mutating input" << std::endl;
+        return 1;
+    }
+    MediaPacket zero_based_next = MakeVideoPacket(false);
+    zero_based_next.pts = 124;
+    zero_based_next.dts = 122;
+    zero_based_next.duration = 2;
+    if (!session.Publish(zero_based_next).WasPublished() ||
+        !scripted->last_packet.has_value() || scripted->last_packet->pts != 6 ||
+        scripted->last_packet->dts != 4 || scripted->last_packet->duration != 2) {
+        std::cerr << "Session did not preserve the zero-based timeline" << std::endl;
+        return 1;
+    }
+    if (!session.Close().Succeed()) return 1;
+
+    // 首个接纳包缺少 PTS/DTS 时不能猜测 epoch；失败不应将包交给 Pusher，
+    // 后续具有时间戳的关键帧仍可建立新的 epoch。
+    if (!session.Open(zero_based_config).Succeed()) return 1;
+    const int pushes_before_missing_timestamp = scripted->push_calls;
+    if (!IsFailedWith(session.Publish(MakeVideoPacket(true)),
+                      PusherErrorCategory::InvalidPacket) ||
+        scripted->push_calls != pushes_before_missing_timestamp ||
+        session.State() != PusherSessionState::WaitingForKeyframe) {
+        std::cerr << "Missing first timestamp was not rejected by StartAtZero" << std::endl;
+        return 1;
+    }
+    MediaPacket valid_after_missing_timestamp = MakeVideoPacket(true);
+    valid_after_missing_timestamp.pts = 502;
+    valid_after_missing_timestamp.dts = 500;
+    if (!session.Publish(valid_after_missing_timestamp).WasPublished() ||
+        !scripted->last_packet.has_value() || scripted->last_packet->pts != 2 ||
+        scripted->last_packet->dts != 0) {
+        std::cerr << "Session did not establish epoch after a rejected packet" << std::endl;
+        return 1;
+    }
+    if (!session.Close().Succeed()) return 1;
+
+    // 若首个有效时间戳包被底层拒绝，epoch 不能被提交；下一次成功写入的
+    // 关键帧必须以自身最早的 DTS/PTS 作为 0 点。
+    if (!session.Open(zero_based_config).Succeed()) return 1;
+    scripted->next_error = MakeError(PusherErrorCategory::InvalidPacket,
+                                     "scripted packet rejection");
+    MediaPacket rejected_first_packet = MakeVideoPacket(true);
+    rejected_first_packet.pts = 302;
+    rejected_first_packet.dts = 300;
+    if (!IsFailedWith(session.Publish(rejected_first_packet),
+                      PusherErrorCategory::InvalidPacket) ||
+        session.State() != PusherSessionState::WaitingForKeyframe) {
+        std::cerr << "Rejected first packet changed the session state" << std::endl;
+        return 1;
+    }
+    MediaPacket accepted_after_rejection = MakeVideoPacket(true);
+    accepted_after_rejection.pts = 402;
+    accepted_after_rejection.dts = 400;
+    if (!session.Publish(accepted_after_rejection).WasPublished() ||
+        !scripted->last_packet.has_value() || scripted->last_packet->pts != 2 ||
+        scripted->last_packet->dts != 0) {
+        std::cerr << "Rejected first packet incorrectly established the epoch" << std::endl;
+        return 1;
+    }
+    if (!session.Close().Succeed()) return 1;
+
+    // StartAtZero 的 epoch 是当前轨道 time base 下的整数 tick。不能把不同
+    // time base 的值静默相减，否则会产生错误的媒体时间轴。
+    if (!session.Open(zero_based_config).Succeed()) return 1;
+    MediaPacket mismatched_time_base = MakeVideoPacket(true);
+    mismatched_time_base.pts = 100;
+    mismatched_time_base.dts = 100;
+    mismatched_time_base.time_base = {1, 50};
+    if (!IsFailedWith(session.Publish(mismatched_time_base),
+                      PusherErrorCategory::InvalidPacket) ||
+        session.State() != PusherSessionState::WaitingForKeyframe) {
+        std::cerr << "StartAtZero accepted a packet with a mismatched time base" << std::endl;
+        return 1;
+    }
+    if (!session.Close().Succeed()) return 1;
 
     // 写入失败后 Session 进入 Failed，不能再继续把包交给已失效输出。
     auto failing_pusher = std::make_unique<ScriptedPusher>();

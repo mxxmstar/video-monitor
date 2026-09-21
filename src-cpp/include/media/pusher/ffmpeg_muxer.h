@@ -30,7 +30,6 @@ struct MuxerOpenOptions {
     MuxerIoOptions io; ///< I/O 超时选项
     std::map<std::string, std::string> io_options;  ///< 给 avio_open2， 网络传输选项
     std::map<std::string, std::string> muxer_options; ///< 给 avformat_write_header， 容器选项
-    bool normalize_timestamps{false};
 };
 
 /// @brief Muxer 选项
@@ -132,7 +131,4 @@ private:
     AVFormatContext* format_ctx_ = nullptr;
     AVStream* video_stream_ = nullptr;
     bool header_written_{false}; ///< 是否已写入头信息
-    bool normalize_timestamps_{false}; ///< 是否需要归一化时间戳
-    bool timestamp_offset_set_{false}; ///< 时间戳偏移量是否设置
-    int64_t timestamp_offset_{0}; ///< 时间戳偏移量
 };

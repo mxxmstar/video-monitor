@@ -232,13 +232,14 @@ int main() {
 
     // 使用真实编码包经过 Publisher 写入。实际链路为：
     // Publisher -> PusherSession -> FFmpegPusher -> FFmpegMuxer。
-    // 该测试同时验证首个关键帧能启动会话、Publisher 会转发后续包、Muxer
-    // 仍会将本地 MP4 的起始时间戳归零，以及 Close() 会写出可读取的尾部。
+    // 该测试同时验证首个关键帧能启动会话、Session 按显式策略将本地输出
+    // 时间轴归零，以及 Close() 会写出可读取的尾部。
     PublisherConfig publisher_config;
     publisher_config.kind = PublisherKind::Client;
     publisher_config.session.pusher.output_url = output_path.string();
     publisher_config.session.pusher.video_track =
         MakeMuxerConfig(encoder.GetOutputInfo());
+    publisher_config.session.timestamp_policy.mode = PusherTimestampMode::StartAtZero;
 
     Publisher publisher;
     const PusherResult open_result = publisher.Open(publisher_config);
