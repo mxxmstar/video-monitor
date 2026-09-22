@@ -327,7 +327,8 @@ public:
 session_pts = packet_pts - first_packet_pts
 ```
 
-不要修改输入 Puller 或 Decoder 的原始时间轴。
+`PusherSession` 不修改输入 Puller 或 Decoder 的原始时间轴；输入侧如需归零，
+由 `MediaStreamSession` 的 `PullerTimestampPolicy` 在交付下游前单独处理。
 
 完成条件：
 
@@ -729,6 +730,26 @@ PTS/DTS 建立 epoch，并要求该策略下的 packet 使用输出轨道声明�
 当前尚未实现自动重连；`TimestampEpochScope` 仅预留重连加入后的 epoch
 生命周期：`Session` 沿用 epoch，`Connection` 在新连接的首包重新建立 epoch。
 当前 `Open()` 与成功的 `Close()` 都会清除 epoch。
+
+### 9.1.1 输入 Puller 的时间轴边界
+
+输入侧也有独立的 `PullerTimestampPolicy`，但它属于
+`MediaStreamSession::SessionConfig`，不是 `FFmpegPullerConfig`。Puller 只负责
+从协议/容器取得原始 PTS、DTS、duration 和 `time_base`；Session 在交付给下游
+前负责策略转换，避免 FFmpeg Puller 同时承担连接、重连和业务时间轴职责。
+
+输入 `StartAtZero` 的约束如下：
+
+- 按 `stream_index` 保存状态，视频必须等待首个关键帧，音频使用首个有效时间戳包；
+- PTS 和 DTS 都无效、时间基无效或 duration 为负时丢弃该包，不猜测时间轴；
+- 只调整 PTS/DTS，duration 保持原时间基中的 tick；
+- FFmpeg 后端同时更新公共 `MediaPacket` 和其 `AVPacket`，保证 Decoder 直接消费
+  后端包时不会读到旧时间戳；
+- `Connection` 在重连后从新连接的有效起点归零；`Session` 将新连接续接到上一
+  连接已发布的逻辑时间末端，即使源端重连后重新从 0 编号也不会产生负时间戳。
+
+输入默认使用 `Preserved`。Puller 不负责修复源端在同一连接内产生的非单调时间戳；
+这类策略应由后续的抖动缓冲或专用时间轴校正层处理。
 
 ### 9.2 停止、事件与并发契约
 
