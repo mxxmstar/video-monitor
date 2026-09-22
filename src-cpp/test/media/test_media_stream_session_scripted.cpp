@@ -2,6 +2,7 @@
 /// @brief 使用测试内假拉流器验证 MediaStreamSession 的基础状态和统计。
 
 #include "media/puller/i_puller.h"
+#include "media/ffmpeg_packet_buffer.h"
 #include "media/simple_buffer.h"
 #include "media/stream/stream_session.h"
 
@@ -19,6 +20,10 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+}
 
 namespace {
 
@@ -149,6 +154,7 @@ private:
         video.media_type = MediaType::VIDEO;
         video.codec_type = CodecType::H264;
         video.stream_index = 0;
+        video.time_base = {1, 1000};
         video.detail = VideoStreamInfo{1920, 1080, 25.0F};
         info.stream_infos.push_back(std::move(video));
         info.video_stream_idx_ = 0;
@@ -174,6 +180,50 @@ PullReadResult MakePacketResult(std::size_t size) {
     packet->buffer = std::make_shared<SimpleBuffer>(
         std::vector<std::uint8_t>(size, 0x5A));
 
+    return {
+        std::nullopt,
+        std::move(packet),
+        PullReadStatus::Packet,
+    };
+}
+
+PullReadResult MakeTimestampedPacket(
+    std::int64_t pts,
+    std::int64_t dts,
+    bool keyframe) {
+    AVPacket* av_packet = av_packet_alloc();
+    if (!av_packet || av_new_packet(av_packet, 16) < 0) {
+        av_packet_free(&av_packet);
+        return {
+            PullError{
+                PullErrorCategory::Internal,
+                AVERROR(ENOMEM),
+                "failed to allocate scripted AVPacket",
+                false,
+            },
+            nullptr,
+            PullReadStatus::FatalError,
+        };
+    }
+    av_packet->pts = pts == kNoTimestamp ? AV_NOPTS_VALUE : pts;
+    av_packet->dts = dts == kNoTimestamp ? AV_NOPTS_VALUE : dts;
+    av_packet->duration = 40;
+    if (keyframe) {
+        av_packet->flags |= AV_PKT_FLAG_KEY;
+    }
+
+    auto packet = std::make_shared<MediaPacket>();
+    packet->type = MediaType::VIDEO;
+    packet->codec = CodecType::H264;
+    packet->stream_index = 0;
+    packet->pts = pts;
+    packet->dts = dts;
+    packet->duration = 40;
+    packet->time_base = {1, 1000};
+    packet->keyframe = keyframe;
+    packet->buffer = std::make_shared<FFmpegPacketBuffer>(av_packet);
+    packet->backend.type = BackendHandle::FFMPEG;
+    packet->backend.ptr = av_packet;
     return {
         std::nullopt,
         std::move(packet),
@@ -357,6 +407,107 @@ bool RunCase(const TestCase& test_case) {
     return true;
 }
 
+bool RunTimestampPolicyTest() {
+    // 非关键帧和无时间戳关键帧都不能建立 epoch；第一个有效关键帧
+    // 使用 min(PTS, DTS) 建立 0 点，后续包保持相同的相对时间轴。
+    std::vector<PullReadResult> results;
+    results.push_back(MakeTimestampedPacket(50, 50, false));
+    results.push_back(MakeTimestampedPacket(kNoTimestamp, kNoTimestamp, true));
+    results.push_back(MakeTimestampedPacket(100, 98, true));
+    results.push_back(MakeTimestampedPacket(140, 138, false));
+    results.push_back(MakeStatusResult(
+        PullReadStatus::EOS,
+        PullErrorCategory::EndOfInput,
+        false,
+        "timestamp policy test complete"));
+
+    boost::asio::io_context io;
+    auto session = std::make_shared<MediaStreamSession>(io);
+    session->SetPuller(std::make_unique<ScriptedPuller>(std::move(results)));
+
+    InputEndpointConfig endpoint;
+    endpoint.uri = "scripted://timestamp-policy";
+    endpoint.puller_kind = PullerKind::FFmpeg;
+    session->SetEndpoint(endpoint);
+
+    SessionConfig config;
+    config.reconnect.enabled = false;
+    config.timestamp_policy.mode = PullerTimestampMode::StartAtZero;
+    session->SetSessionConfig(config);
+
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::vector<std::int64_t> pts;
+    std::vector<std::int64_t> dts;
+    std::vector<std::int64_t> durations;
+    bool backend_timestamps_synced = true;
+    bool stopped = false;
+
+    session->SetPacketCallback(
+        [&mutex, &condition, &pts, &dts, &durations,
+         &backend_timestamps_synced](
+            std::shared_ptr<MediaPacket> packet) {
+            if (!packet) return;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                pts.push_back(packet->pts);
+                dts.push_back(packet->dts);
+                durations.push_back(packet->duration);
+                if (packet->backend.type == BackendHandle::FFMPEG &&
+                    packet->backend.ptr != nullptr) {
+                    const auto* av_packet =
+                        static_cast<const AVPacket*>(packet->backend.ptr);
+                    backend_timestamps_synced =
+                        backend_timestamps_synced &&
+                        av_packet->pts == packet->pts &&
+                        av_packet->dts == packet->dts;
+                }
+            }
+            condition.notify_all();
+        });
+    session->SetStateCallback(
+        [&mutex, &condition, &stopped](MediaStreamSession::State state) {
+            if (state != MediaStreamSession::State::KSTOPPED) return;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                stopped = true;
+            }
+            condition.notify_all();
+        });
+
+    if (!session->Start()) {
+        std::cerr << "Timestamp policy session failed to start" << std::endl;
+        return false;
+    }
+
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (!condition.wait_for(lock, std::chrono::seconds(2),
+                                [&] { return stopped; })) {
+            std::cerr << "Timestamp policy test timed out" << std::endl;
+            session->Stop();
+            return false;
+        }
+    }
+    session->Stop();
+
+    if (pts != std::vector<std::int64_t>{2, 42} ||
+        dts != std::vector<std::int64_t>{0, 40} ||
+        durations != std::vector<std::int64_t>{40, 40}) {
+        std::cerr << "Puller timestamp policy produced unexpected timestamps"
+                  << std::endl;
+        return false;
+    }
+    if (!backend_timestamps_synced) {
+        std::cerr << "MediaPacket and AVPacket timestamps diverged"
+                  << std::endl;
+        return false;
+    }
+
+    std::cout << "Puller timestamp policy passed" << std::endl;
+    return true;
+}
+
 }  // namespace
 
 int main() {
@@ -382,6 +533,10 @@ int main() {
         if (!RunCase(test_case)) {
             return 1;
         }
+    }
+
+    if (!RunTimestampPolicyTest()) {
+        return 1;
     }
 
     std::cout << "MediaStreamSession scripted tests passed" << std::endl;

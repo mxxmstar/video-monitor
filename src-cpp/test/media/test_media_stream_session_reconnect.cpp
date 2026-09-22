@@ -172,6 +172,7 @@ private:
         video.media_type = MediaType::VIDEO;
         video.codec_type = CodecType::H264;
         video.stream_index = 0;
+        video.time_base = {1, 1000};
         video.detail = VideoStreamInfo{1280, 720, 25.0F};
         info.stream_infos.push_back(std::move(video));
         info.video_stream_idx_ = 0;
@@ -193,6 +194,29 @@ PullReadResult MakePacketResult(std::size_t size) {
     packet->buffer = std::make_shared<SimpleBuffer>(
         std::vector<std::uint8_t>(size, 0x5A));
 
+    return {
+        std::nullopt,
+        std::move(packet),
+        PullReadStatus::Packet,
+    };
+}
+
+PullReadResult MakeTimestampedPacket(
+    std::int64_t pts,
+    std::int64_t dts,
+    bool keyframe = true,
+    Rational time_base = {1, 1000}) {
+    auto packet = std::make_shared<MediaPacket>();
+    packet->type = MediaType::VIDEO;
+    packet->codec = CodecType::H264;
+    packet->stream_index = 0;
+    packet->pts = pts;
+    packet->dts = dts;
+    packet->duration = 40;
+    packet->time_base = time_base;
+    packet->keyframe = keyframe;
+    packet->buffer = std::make_shared<SimpleBuffer>(
+        std::vector<std::uint8_t>(16, 0x5A));
     return {
         std::nullopt,
         std::move(packet),
@@ -230,6 +254,8 @@ struct Observations {
     std::condition_variable condition;
     int packet_count{0};
     std::size_t packet_bytes{0};
+    std::vector<std::int64_t> packet_pts;
+    std::vector<std::int64_t> packet_dts;
     int stream_info_count{0};
     std::vector<MediaStreamSession::State> states;
     std::optional<MediaStreamSession::State> terminal_state;
@@ -258,6 +284,8 @@ void AttachCallbacks(const std::shared_ptr<MediaStreamSession>& session,
                 std::lock_guard<std::mutex> lock(observations.mutex);
                 ++observations.packet_count;
                 observations.packet_bytes += packet->buffer->Size();
+                observations.packet_pts.push_back(packet->pts);
+                observations.packet_dts.push_back(packet->dts);
             }
             observations.condition.notify_all();
         });
@@ -650,6 +678,74 @@ bool RunStableResetTest() {
     return true;
 }
 
+bool RunTimestampReconnectScopeTest(PullerTimestampEpochScope scope,
+                                    std::int64_t expected_second_pts,
+                                    const char* scope_name,
+                                    Rational second_time_base = {1, 1000}) {
+    std::vector<std::vector<PullReadResult>> scripts;
+    scripts.push_back({
+        MakeTimestampedPacket(100, 98),
+        MakeStatusResult(
+            PullReadStatus::RetryableError,
+            PullErrorCategory::Network,
+            true,
+            "timestamp connection lost"),
+    });
+    scripts.push_back({
+        // 模拟摄像头重连后重新从 0 开始编号。
+        MakeTimestampedPacket(0, 0, true, second_time_base),
+        MakeStatusResult(
+            PullReadStatus::EOS,
+            PullErrorCategory::EndOfInput,
+            false,
+            "timestamp reconnect complete"),
+    });
+
+    boost::asio::io_context io;
+    auto session = std::make_shared<MediaStreamSession>(io);
+    session->SetPuller(std::make_unique<ReconnectPuller>(
+        std::vector<bool>{true, true}, std::move(scripts)));
+
+    InputEndpointConfig endpoint;
+    endpoint.uri = "scripted://timestamp-reconnect";
+    endpoint.puller_kind = PullerKind::FFmpeg;
+    session->SetEndpoint(endpoint);
+
+    SessionConfig config;
+    config.reconnect.enabled = true;
+    config.reconnect.initial_delay = std::chrono::milliseconds(0);
+    config.reconnect.max_attempts = 1;
+    config.timestamp_policy.mode = PullerTimestampMode::StartAtZero;
+    config.timestamp_policy.scope = scope;
+    session->SetSessionConfig(config);
+
+    Observations observations;
+    AttachCallbacks(session, observations);
+    if (!session->Start() || !WaitForTerminal(session, observations)) {
+        std::cerr << scope_name << ": timestamp reconnect did not finish"
+                  << std::endl;
+        session->Stop();
+        return false;
+    }
+
+    session->Stop();
+    if (observations.packet_pts.size() != 2 ||
+        observations.packet_dts.size() != 2 ||
+        observations.packet_pts[0] != 2 || observations.packet_dts[0] != 0 ||
+        observations.packet_pts[1] != expected_second_pts ||
+        observations.packet_dts[1] != expected_second_pts) {
+        std::cerr << scope_name << ": timestamp scope assertion failed"
+                  << std::endl;
+        return false;
+    }
+
+    std::cout << scope_name << ": first=(" << observations.packet_pts[0]
+              << "," << observations.packet_dts[0] << "), second=("
+              << observations.packet_pts[1] << ","
+              << observations.packet_dts[1] << ")" << std::endl;
+    return true;
+}
+
 }  // namespace
 
 int main() {
@@ -666,6 +762,19 @@ int main() {
         return 1;
     }
     if (!RunStableResetTest()) {
+        return 1;
+    }
+    if (!RunTimestampReconnectScopeTest(
+            PullerTimestampEpochScope::Session, 42, "Session timestamp scope")) {
+        return 1;
+    }
+    if (!RunTimestampReconnectScopeTest(
+            PullerTimestampEpochScope::Connection, 0, "Connection timestamp scope")) {
+        return 1;
+    }
+    if (!RunTimestampReconnectScopeTest(
+            PullerTimestampEpochScope::Session, 3780,
+            "Session timestamp time-base rescale", Rational{1, 90000})) {
         return 1;
     }
 

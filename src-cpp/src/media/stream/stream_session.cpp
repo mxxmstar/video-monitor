@@ -9,6 +9,12 @@
 
 #include "common/log/logger.h"
 
+extern "C" {
+#include <libavcodec/packet.h>
+#include <libavutil/avutil.h>
+#include <libavutil/mathematics.h>
+}
+
 namespace {
 
 const char* StateNameImpl(MediaStreamSession::State state) {
@@ -21,6 +27,38 @@ const char* StateNameImpl(MediaStreamSession::State state) {
         case MediaStreamSession::State::KERROR:        return "ERROR";
     }
     return "UNKNOWN";
+}
+
+std::int64_t RescaleTimestamp(std::int64_t timestamp, const Rational& source_time_base, 
+    const Rational& target_time_base) {
+    return av_rescale_q(timestamp, AVRational{source_time_base.num, source_time_base.den},
+        AVRational{target_time_base.num, target_time_base.den});
+}
+
+std::optional<std::int64_t> EarliestTimestamp(const MediaPacket& packet) {
+    std::optional<std::int64_t> earliest;
+    if (IsValidTimestamp(packet.pts)) earliest = packet.pts;
+    if (IsValidTimestamp(packet.dts) &&
+        (!earliest.has_value() || packet.dts < *earliest)) {
+        earliest = packet.dts;
+    }
+    return earliest;
+}
+
+/// @brief 检查 value - offset 是否会下溢
+bool CanSubtractTimestamp(std::int64_t value, std::int64_t offset) {
+    const auto minimum = (std::numeric_limits<std::int64_t>::min)();
+    const auto maximum = (std::numeric_limits<std::int64_t>::max)();
+    return (offset > 0 && value >= minimum + offset) ||
+           (offset < 0 && value <= maximum + offset) || offset == 0;
+}
+
+/// @brief 检查 value + offset 是否会溢出
+bool CanAddTimestamp(std::int64_t value, std::int64_t offset) {
+    const auto maximum = (std::numeric_limits<std::int64_t>::max)();
+    const auto minimum = (std::numeric_limits<std::int64_t>::min)();
+    return (offset > 0 && value <= maximum - offset) ||
+           (offset < 0 && value >= minimum - offset) || offset == 0;
 }
 
 }  // namespace
@@ -121,6 +159,10 @@ bool MediaStreamSession::Start() {
         return false;
     }
 
+    // Start() 创建一个新的逻辑输入会话。上一次 Stop() 的连接状态不能
+    // 泄漏到新会话，即使 Puller 实例被复用。
+    timestamp_states_.clear();
+
     setState(State::KCONNECTING);
     const PullOpenResult result = puller_->Open(endpoint_);
     if (!result.Succeed()) {
@@ -212,6 +254,7 @@ bool MediaStreamSession::tryReconnect(int& reconnect_attempts) {
         }
 
         if (open_result.Succeed()) {
+            resetTimestampForConnection();
             setState(State::KCONNECTED);
             notifyStreamInfo();
             return true;
@@ -306,6 +349,7 @@ void MediaStreamSession::Stop() {
             thread_to_join.join();
         }
     }
+    timestamp_states_.clear();
     setState(State::KSTOPPED);
 }
 
@@ -350,6 +394,10 @@ void MediaStreamSession::readLoop() {
                     stats_.bytes_received += result.packet->buffer->Size();
                 }
 
+                if (!applyPullerTimestampPolicy(*result.packet)) {
+                    break;
+                }
+
                 PacketCallback packet_callback;
                 {
                     std::lock_guard<std::mutex> callback_lock(cb_mutex_);
@@ -372,8 +420,7 @@ void MediaStreamSession::readLoop() {
                 setState(State::KSTOPPED);
                 break;
             case PullReadStatus::RetryableError: {
-                const bool retryable =
-                    result.error.has_value() && result.error->retryable;
+                const bool retryable = result.error.has_value() && result.error->retryable;
                 if (retryable && tryReconnect(reconnect_attempts)) {
                     // tryReconnect() 返回 true 代表已经成功建立了新的
                     // 连接代次，稳定计时应从这一刻重新开始。
@@ -428,6 +475,120 @@ void MediaStreamSession::setState(State state) {
     }
     if (callback) {
         callback(state);
+    }
+}
+
+bool MediaStreamSession::applyPullerTimestampPolicy(MediaPacket& packet) {
+    if (session_config_.timestamp_policy.mode == PullerTimestampMode::Preserved) {
+        return true;
+    }
+
+    if (!IsValidTimeBase(packet.time_base)) {
+        LOG_WARN("Dropping packet with invalid timestamp time base");
+        return false;
+    }
+    TimestampStreamState& state = timestamp_states_[packet.stream_index];
+
+    // 视频从关键帧开始建立时间轴，避免下游从无法独立解码的 P/B 帧开始；
+    // 音频没有关键帧概念，只要求首个包带有效时间戳。
+    if (!state.connection_epoch.has_value() && packet.type == MediaType::VIDEO && !packet.keyframe) {
+        LOG_WARN("Dropping non-keyframe video packet");
+        return false;
+    }
+
+    if (!IsValidTimestamp(packet.pts) && !IsValidTimestamp(packet.dts)) {
+        LOG_WARN("Dropping packet without PTS or DTS");
+        return false;
+    }
+
+    // 保存首次有效包的时间戳作为原始起点
+    if (!state.connection_epoch.has_value()) {
+        const auto epoch = EarliestTimestamp(packet);
+        if (!epoch.has_value()) {
+            LOG_WARN("Dropping first packet without PTS or DTS in StartAtZero mode");
+            return false;
+        }
+
+        state.connection_epoch = *epoch;
+        state.output_offset = 0;
+
+        if (session_config_.timestamp_policy.scope == PullerTimestampEpochScope::Session && state.last_epoch.has_value()) {
+            state.output_offset = RescaleTimestamp(*state.last_epoch, state.last_epoch_time_base, packet.time_base);
+            state.last_epoch = state.output_offset;
+            state.last_epoch_time_base = packet.time_base;
+        }
+    }
+
+    const auto normalize = [&](std::int64_t timestamp) -> std::optional<std::int64_t> {
+        if (!IsValidTimestamp(timestamp)) {
+            return timestamp;
+        }
+        if (!CanSubtractTimestamp(timestamp, *state.connection_epoch)) {
+            LOG_WARN("Timestamp subtraction would underflow");
+            return std::nullopt;
+        }
+        const std::int64_t relative = timestamp - *state.connection_epoch;
+        if (!CanAddTimestamp(relative, state.output_offset)) {
+            LOG_WARN("Timestamp addition would overflow");
+            return std::nullopt;
+        }
+        return relative + state.output_offset;
+    };
+
+    const auto normalized_pts = normalize(packet.pts);
+    const auto normalized_dts = normalize(packet.dts);
+    if ((IsValidTimestamp(packet.pts) && !normalized_pts.has_value()) ||
+        (IsValidTimestamp(packet.dts) && !normalized_dts.has_value())) {
+        LOG_WARN("Dropping packet with unrepresentable normalized timestamp");
+        return false;
+    }
+
+    if (normalized_pts.has_value()) {
+        packet.pts = *normalized_pts;
+    }
+    if (normalized_dts.has_value()) {
+        packet.dts = *normalized_dts;
+    }
+
+    int64_t last_output = std::numeric_limits<int64_t>::min();
+    // pts 通常大于等于 dts，确保 last_output 是最大的时间戳
+    if (IsValidTimestamp(packet.dts)) last_output = packet.dts;
+    if (IsValidTimestamp(packet.pts) && packet.pts > last_output) last_output = packet.pts;
+    
+    if (IsValidTimestamp(packet.duration) && packet.duration > 0) {
+        last_output += packet.duration;
+    }    
+    if (!state.last_epoch.has_value() || last_output > *state.last_epoch) {
+        state.last_epoch = last_output;
+        state.last_epoch_time_base = packet.time_base;
+    }
+
+    // FFmpegDecoder 在 time_base 一致时会直接使用 backend.ptr 指向的
+    // AVPacket，而不是重新读取 MediaPacket 的公共字段。两份表示必须同步。
+    if (packet.backend.type == BackendHandle::FFMPEG && packet.backend.ptr) {
+        auto* av_packet = static_cast<AVPacket*>(packet.backend.ptr);
+        av_packet->pts = IsValidTimestamp(packet.pts) ? packet.pts : AV_NOPTS_VALUE;
+        av_packet->dts = IsValidTimestamp(packet.dts) ? packet.dts : AV_NOPTS_VALUE;
+    }
+
+    return true;
+}
+
+void MediaStreamSession::resetTimestampForConnection() {
+    if (session_config_.timestamp_policy.mode == PullerTimestampMode::Preserved) {
+        timestamp_states_.clear();
+        return;
+    }
+
+    for (auto& [stream_index, state] : timestamp_states_) {
+        (void)stream_index;
+        state.connection_epoch.reset();
+        state.output_offset = 0;
+        if (session_config_.timestamp_policy.scope ==
+            PullerTimestampEpochScope::Connection) {
+            state.last_epoch.reset();
+            state.last_epoch_time_base = Rational{1, 1};
+        }
     }
 }
 

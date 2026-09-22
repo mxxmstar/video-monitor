@@ -36,12 +36,30 @@ struct SessionJitterConfig {
     double alpha{0.9};   ///< 平滑系数
 };
 
+enum class PullerTimestampMode {
+    Preserved,  ///< 保留服务端原始时间戳，不进行转换
+    StartAtZero, ///< 转换为从零开始的时间戳，视频从首个关键帧开始计时
+};
+
+enum class PullerTimestampEpochScope {
+    Session,     ///< 自动重连后连续到上一连接的逻辑时间轴
+    Connection,  ///< 自动重连后以新连接的首个有效包重新从零开始
+};
+
+/// @brief Puller 时间戳策略
+struct PullerTimestampPolicy {
+    PullerTimestampMode mode{PullerTimestampMode::Preserved};
+    PullerTimestampEpochScope scope{PullerTimestampEpochScope::Session};
+};
+
+
 /// @brief 媒体流 Session 配置
 struct SessionConfig {
     ReconnectPolicy reconnect;   ///< 重连策略
     WatchdogConfig watchdog;     ///< watchdog 配置
     SessionJitterConfig jitter;   ///< jitter buffer 配置
     std::chrono::milliseconds no_data_backoff{1};   ///< 无数据超时时间间隔
+    PullerTimestampPolicy timestamp_policy;   ///< Session 输出给下游前的输入时间轴策略
 };
 
 /// @brief 业务源配置

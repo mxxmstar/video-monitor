@@ -6,7 +6,9 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -29,6 +31,7 @@
 ///
 /// 自身不持有 StreamInfo，通过回调向上层（MediaStreamSource）报告。
 /// 自身不持有解码器 / pipeline / sink。
+/// 时间轴策略在这里作用于 Puller 交付的 packet；Puller 本身只保留源时间戳。
 ///
 /// 不持有线程 —— ReadLoop 被 post 到构造时传入的 io_context 上，
 /// 由外部线程池或 io_context::run() 驱动。方便配合线程池 / io_context 池统一管理。
@@ -96,6 +99,27 @@ private:
     void notifyStreamInfo();
     void setState(State state);
 
+    /// @brief 应用 Puller 时间戳策略。
+    /// @return 时间戳有效且已完成归一化时返回 true；否则丢弃该包。
+    bool applyPullerTimestampPolicy(MediaPacket& packet);
+    void resetTimestampForConnection();
+
+    // TODO: 处理时间基变化的情况
+    struct TimestampStreamState {
+        /// @brief 当前连接的原始起点。
+        std::optional<std::int64_t> connection_epoch;
+        Rational connection_time_base{1, 1};     ///< 当前连接的时间基，默认 1/1
+
+        // 当前新连接输出相对原始起点的偏移。Session scope 重连时由
+        // 上一连接的 last_epoch 转换到新连接的时间基。
+        std::int64_t output_offset{0};
+        Rational output_time_base{1, 1};     ///< 当前新连接的时间基，暂不考虑时间基发生变化的情况
+
+        // 已经发布的逻辑时间轴末端，供 Session scope 的下一连接续接。
+        std::optional<std::int64_t> last_epoch;
+        Rational last_epoch_time_base{1, 1};
+    };
+
     boost::asio::io_context& io_;   ///< 异步 I/O 上下文，用于调度 ReadLoop
     std::unique_ptr<IPuller> puller_; ///< 拉流器，负责从服务器拉取数据
     InputEndpointConfig endpoint_;   ///< 输入端点配置，包含 URL、端口、用户名、密码等
@@ -118,4 +142,6 @@ private:
     PacketCallback packet_cb_;       ///< 数据包回调函数，用于处理从 puller 接收到的数据包
     StreamInfoCallback streaminfo_cb_; ///< 流信息回调函数，用于处理从 puller 接收到的流信息
     StateCallback state_cb_;         ///< 状态回调函数话状态变化
+
+    std::map<int, TimestampStreamState> timestamp_states_; ///< 按媒体流保存时间轴状态
 };

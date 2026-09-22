@@ -552,24 +552,19 @@ PullReadResult FFmpegPuller::ReadPacket() {
     // 3. 提取流信息（用于填充 MediaPacket）
     const AVStream* stream = fmt_ctx_->streams[stream_index];
     auto media_packet = std::make_shared<MediaPacket>();
-    media_packet->type = codecpar->codec_type == AVMEDIA_TYPE_VIDEO
-        ? MediaType::VIDEO
-        : MediaType::AUDIO;
+    media_packet->type = codecpar->codec_type == AVMEDIA_TYPE_VIDEO ? MediaType::VIDEO : MediaType::AUDIO;
     media_packet->codec = FromAVCodecID(codecpar->codec_id);
     media_packet->stream_index = stream_index;
     media_packet->pts = owned_packet->pts == AV_NOPTS_VALUE
-        ? kNoTimestamp
-        : owned_packet->pts;
+        ? kNoTimestamp : owned_packet->pts;
     media_packet->dts = owned_packet->dts == AV_NOPTS_VALUE
-        ? kNoTimestamp
-        : owned_packet->dts;
+        ? kNoTimestamp : owned_packet->dts;
     media_packet->duration = owned_packet->duration == AV_NOPTS_VALUE
-        ? kNoTimestamp
-        : owned_packet->duration;
-    media_packet->time_base = {
-        stream->time_base.num,
-        stream->time_base.den,
-    };
+        ? kNoTimestamp : owned_packet->duration;
+    // media_packet->pts = owned_packet->pts;
+    // media_packet->dts = owned_packet->dts;
+    // media_packet->duration = owned_packet->duration;
+    media_packet->time_base = {stream->time_base.num, stream->time_base.den};
     media_packet->keyframe = (owned_packet->flags & AV_PKT_FLAG_KEY) != 0;
     media_packet->buffer = std::make_shared<FFmpegPacketBuffer>(owned_packet);
     media_packet->backend.type = BackendHandle::FFMPEG;
