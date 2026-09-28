@@ -39,6 +39,7 @@ src-cpp/*.lib
 src-cpp/*.pdb
 build-vs/*
 build-ninja*/*
+build/*
 .vs/*
 .vscode/*
 

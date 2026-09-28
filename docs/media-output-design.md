@@ -765,9 +765,36 @@ PTS/DTS 建立 epoch，并要求该策略下的 packet 使用输出轨道声明�
 `PusherSession` 串行处理状态迁移和重连。不能让 Pusher 回调直接改 Publisher
 状态，也不能用字符串回调让 Session 解析 FFmpeg 错误文本。
 
+当前已提供 `IPusher::RequestStop()` 与 `PusherEvent{stage, error}`。停止请求仅
+设置 Muxer 的中断标记，可从其他线程调用；`Open/Push/Close` 在 Pusher 和
+Session 内分别串行，`Close()` 等待正在执行的写入结束，再返回 trailer/关闭
+结果。调用方需要中断阻塞写入时先调用 `RequestStop()`，再调用 `Close()`。
+异步事件回调只投递事件。当前过渡实现中，每个 Session 持有一条事件线程，
+阻塞等待 `common/queue` 的并发事件队列；事件线程可先调用 `RequestStop()`
+中断阻塞 I/O，再与同步
+`Open/Publish/Close` 串行更新会话状态和 `LastEvent()`。事件无需等待下次
+`State()` 或 `Publish()` 才生效。关闭和重开会更新连接代次，丢弃旧连接的
+迟到事件；析构时注销回调并停止、等待事件线程退出。当前 FFmpeg 输出只通过
+同步调用结果报告错误，没有独立的异步事件源，也未实现自动重连。
+
 当前同步 `Publish()` 明确会把网络写入背压传给调用线程。以后若增加队列，队列
 归 Session 所有，需在配置中定义容量、满队列策略、停止时丢弃规则和统计口径；
 Publisher 只暴露结果和控制入口。
+
+多输出目标异步化时，再由 `Publisher` 创建并持有**一个共享 watchdog**，统一
+监控它管理的所有 `PusherSession`，不为每个 Session 创建 watchdog 线程。
+每个 Session 独立保存连接状态、写入进度和重连策略，并向 watchdog 注册、
+注销及上报结构化事件。watchdog 使用事件通知和最近的超时/退避截止时间
+唤醒，按 Session 标识分发事件；避免逐路高频轮询。
+
+共享 watchdog 负责判断写入超时、连接故障和重连时机，并可跨线程调用对应
+Session 的 `RequestStop()` 中断阻塞 I/O。它不能在写入尚未退出时直接对该
+Pusher 调用 `Close/Open`，也不能由事件回调直接修改 Publisher 状态。
+当前写入退出后，由 Session 在串行执行路径中处理事件、完成 `Close()`、
+退避和 `Open()`；重连后的首包仍受关键帧门控。Publisher 关闭或移除
+Session 时先停止监控并注销事件来源，再等待该 Session 的 I/O 和资源清理，
+避免 watchdog 持有失效的 Session 引用。写入执行者与共享 watchdog 分离；
+是否使用独立写入线程或共享执行器由后续队列方案确定。
 
 ### 9.3 Packet 所有权与重试
 
