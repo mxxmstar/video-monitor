@@ -234,6 +234,8 @@ FFmpegPusher::~FFmpegPusher() {
 }
 
 PusherResult FFmpegPusher::Open(const PusherConfig& config) {
+    std::lock_guard<std::recursive_mutex> lock(operation_mutex_);
+    const auto stop_generation = muxer_.StopGeneration();
     // 一个 Pusher 同一时刻只对应一个输出目标。
     // 重复 Open 时先完整结束旧的容器，避免新输出错误地复用旧的 AVFormatContext 或 AVIOContext。
     const auto close_result = Close();
@@ -255,7 +257,7 @@ PusherResult FFmpegPusher::Open(const PusherConfig& config) {
     if (!resolved_output.has_value()) return resolve_error;
 
     network_output_ = resolved_output->network_output;
-    MuxerResult muxer_result = muxer_.Open(resolved_output->options, config.video_track);
+    MuxerResult muxer_result = muxer_.Open(resolved_output->options, config.video_track, stop_generation);
     if (!muxer_result.Succeed()) {
         return MapMuxerError(*muxer_result.error, network_output_);
     }
@@ -266,6 +268,7 @@ PusherResult FFmpegPusher::Open(const PusherConfig& config) {
 }
 
 PusherResult FFmpegPusher::Push(const MediaPacket& packet) {
+    std::lock_guard<std::recursive_mutex> lock(operation_mutex_);
     if (!opened_) {
         return MakeFailure(PusherErrorCategory::InvalidState,
                            "FFmpegPusher::Push called before a successful Open");
@@ -307,6 +310,7 @@ PusherResult FFmpegPusher::Push(const MediaPacket& packet) {
 }
 
 PusherResult FFmpegPusher::Close() {
+    std::lock_guard<std::recursive_mutex> lock(operation_mutex_);
     const auto result = muxer_.Close();
 
     opened_ = false;
@@ -314,7 +318,13 @@ PusherResult FFmpegPusher::Close() {
     return result.Succeed() ? PusherResult::Success() : MapMuxerError(*result.error, network_output_);
 }
 
+PusherResult FFmpegPusher::RequestStop() {
+    muxer_.RequestStop();
+    return PusherResult::Success();
+}
+
 bool FFmpegPusher::IsOpen() const {
+    std::lock_guard<std::recursive_mutex> lock(operation_mutex_);
     return opened_;
 }
 

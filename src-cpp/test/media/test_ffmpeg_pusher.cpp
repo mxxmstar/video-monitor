@@ -221,6 +221,16 @@ int main() {
         return 1;
     }
     muxer.Close();
+    const auto opening_generation = muxer.StopGeneration();
+    muxer.RequestStop();
+    const auto interrupted_open = muxer.Open(MakeMuxerOpenOptions(output_path.string()),
+        MakeValidConfig("unused.mp4").video_track, opening_generation);
+    if (interrupted_open.Succeed() ||
+        interrupted_open.error->category != MuxerErrorCategory::Cancelled ||
+        interrupted_open.error->operation != MuxerOperation::OpenIo) {
+        std::cerr << "Stop during opening preparation was lost" << std::endl;
+        return 1;
+    }
     if (!muxer.Open(MakeMuxerOpenOptions(output_path.string()),
                     MakeValidConfig("unused.mp4").video_track).Succeed() ||
         !muxer.Close().Succeed()) {

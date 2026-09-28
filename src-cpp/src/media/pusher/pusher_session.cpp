@@ -41,11 +41,31 @@ PusherSession::PusherSession() : PusherSession(std::make_unique<FFmpegPusher>())
 }
 
 PusherSession::PusherSession(std::unique_ptr<IPusher> pusher) : pusher_(std::move(pusher)) {
-
+    if (pusher_) {
+        pusher_->SetEventCallback([this](const PusherEvent& event) {
+            std::lock_guard<std::mutex> lock(event_mutex_);
+            // 如果事件队列已停止或未激活，直接返回。
+            if (event_thread_stopping_ || !event_active_) {
+                return;
+            }
+            event_queue_.push(QueuedEvent{event, event_generation_});
+        });
+    }
+    event_thread_ = std::thread(&PusherSession::eventLoop, this);
 }
 
 PusherSession::~PusherSession() {
     Close();
+    if (pusher_) {
+        pusher_->SetEventCallback({});
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(event_mutex_);
+        event_thread_stopping_ = true;
+        event_queue_.push(std::nullopt);  // 发送 nullopt 通知事件线程退出
+    }
+    event_thread_.join();
 }
 
 PusherError PusherSession::MakeError(PusherErrorCategory category, const char* message) {
@@ -53,6 +73,7 @@ PusherError PusherSession::MakeError(PusherErrorCategory category, const char* m
 }
 
 PusherResult PusherSession::Open(const PusherSessionConfig& config) {
+    std::lock_guard<std::recursive_mutex> lock(operation_mutex_);
     // 一个 Session 同一时刻只管理一个输出会话。
     // 重新打开时先完成旧容器的 trailer 写入，避免旧容器与新容器共用同一个输出上下文。
     if (state_ != PusherSessionState::Closed) {
@@ -73,30 +94,53 @@ PusherResult PusherSession::Open(const PusherSessionConfig& config) {
             "PusherSession received an invalid output configuration"));
     }
 
+    stop_requested_.store(false);
+    {
+        std::lock_guard<std::mutex> event_lock(event_mutex_);
+        ++event_generation_;
+        event_active_ = true;
+    }
+    last_event_.reset();
     const PusherResult open_result = pusher_->Open(config.pusher);
     if (!open_result.Succeed()) {
+        {
+            std::lock_guard<std::mutex> event_lock(event_mutex_);
+            event_active_ = false;
+            ++event_generation_;
+        }
         state_ = PusherSessionState::Failed;
         return open_result;
+    }
+    // 输出容器已经准备好，但任意 P/B 帧都不能作为新视频的起点。先等待
+    // IDR 等关键帧，确保 MP4 和后续网络输出可以独立解码。
+    state_ = PusherSessionState::WaitingForKeyframe;
+    if (stop_requested_.load()) {
+        state_ = PusherSessionState::Failed;
+        return PusherResult::Failed(MakeError(PusherErrorCategory::Cancelled, "PusherSession stopped during Open"));
     }
 
     timestamp_policy_ = config.timestamp_policy;
     timestamp_epoch_.reset();
     timestamp_time_base_ = Rational{config.pusher.video_track.time_base_num,
                                     config.pusher.video_track.time_base_den};
-
-    // 输出容器已经准备好，但任意 P/B 帧都不能作为新视频的起点。先等待
-    // IDR 等关键帧，确保 MP4 和后续网络输出可以独立解码。
-    state_ = PusherSessionState::WaitingForKeyframe;
     return PusherResult::Success();
 }
 
 PusherPublishResult PusherSession::Publish(const MediaPacket& packet) {
+    std::lock_guard<std::recursive_mutex> lock(operation_mutex_);
+    if (stop_requested_.load()) {
+        return PusherPublishResult::Failed(MakeError(PusherErrorCategory::Cancelled,
+            "PusherSession has been asked to stop"));
+    }
     if (state_ == PusherSessionState::Closed) {
         return PusherPublishResult::Failed(MakeError(PusherErrorCategory::InvalidState,
             "PusherSession::Publish called before a successful Open"));
     }
 
     if (state_ == PusherSessionState::Failed) {
+        if (last_event_.has_value()) {
+            return PusherPublishResult::Failed(last_event_->error);
+        }
         return PusherPublishResult::Failed(MakeError(PusherErrorCategory::InvalidState,
             "PusherSession is failed; close and open it before publishing again"));
     }
@@ -152,6 +196,13 @@ PusherPublishResult PusherSession::forwardAcceptedPacket(const MediaPacket& pack
 
         return PusherPublishResult::Failed(MakeError(PusherErrorCategory::Internal,
             "Pusher returned a failed result without an error"));
+    }
+    if (stop_requested_.load()) {
+        return PusherPublishResult::Failed(MakeError(PusherErrorCategory::Cancelled,
+            "PusherSession stopped during Publish"));
+    }
+    if (state_ == PusherSessionState::Failed) {
+        return PusherPublishResult::Failed(last_event_->error);
     }
 
     if (state_ == PusherSessionState::WaitingForKeyframe) {
@@ -209,6 +260,12 @@ PusherResult PusherSession::applyPusherTimestampPolicy(MediaPacket& packet) {
 }
 
 PusherResult PusherSession::Close() {
+    std::lock_guard<std::recursive_mutex> lock(operation_mutex_);
+    {
+        std::lock_guard<std::mutex> event_lock(event_mutex_);
+        ++event_generation_;
+        event_active_ = false;
+    }
     if (!pusher_) {
         state_ = PusherSessionState::Closed;
         timestamp_epoch_.reset();
@@ -231,4 +288,54 @@ PusherResult PusherSession::Close() {
         timestamp_time_base_.reset();
     }
     return close_result;
+}
+
+PusherResult PusherSession::RequestStop() {
+    stop_requested_.store(true);
+    if (!pusher_) {
+        return PusherResult::Success();
+    }
+    return pusher_->RequestStop();
+}
+
+void PusherSession::eventLoop() {
+    for (;;) {
+        std::optional<QueuedEvent> queued;
+        event_queue_.wait_pop(queued);
+        if (!queued.has_value()) {
+            return;  // 收到 nullopt 时，退出事件线程
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(event_mutex_);
+
+            // 在等待 operation_lock 之前，中断被阻塞的推送。
+            if (event_active_ && queued->generation == event_generation_ && pusher_ &&
+                queued->event.error.category != PusherErrorCategory::Cancelled) {
+                pusher_->RequestStop();
+            }
+        }
+
+        std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
+        std::lock_guard<std::mutex> event_lock(event_mutex_);
+        if (!event_active_ || queued->generation != event_generation_) {
+            continue;  // 事件代际过期不匹配，跳过
+        }
+        // 更新事件记录和状态
+        last_event_ = std::move(queued->event);
+        if (state_ != PusherSessionState::Closed &&
+            !(stop_requested_.load() && last_event_->error.category == PusherErrorCategory::Cancelled)) {
+            state_ = PusherSessionState::Failed;
+        }
+    }
+}
+
+PusherSessionState PusherSession::State() const {
+    std::lock_guard<std::recursive_mutex> lock(operation_mutex_);
+    return state_;
+}
+
+std::optional<PusherEvent> PusherSession::LastEvent() const {
+    std::lock_guard<std::recursive_mutex> lock(operation_mutex_);
+    return last_event_;
 }

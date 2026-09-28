@@ -46,6 +46,9 @@ public:
     /// @brief 发布状态。
     PublisherState State() const noexcept;
 
+    /// @brief 请求结束当前发布任务。
+    PusherResult RequestStop();
+
 private:
     static PusherError MakeError(PusherErrorCategory category, const char* message);
 

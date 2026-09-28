@@ -26,7 +26,7 @@ public:
     PusherResult Push(const MediaPacket& packet) override;
     PusherResult Close() override;
     bool IsOpen() const override;
-    void RequestStop() { muxer_.RequestStop(); }
+    PusherResult RequestStop() override;
 
     void SetEventCallback(EventCallback cb) override;
 
@@ -40,4 +40,5 @@ private:
 
     EventCallback event_cb_;                   ///< 事件回调
     mutable std::mutex callback_mutex_; ///< 保护 event_cb_ 的互斥锁
+    mutable std::recursive_mutex operation_mutex_; ///< 串行化 Open/Push/Close 与资源访问
 };

@@ -1,9 +1,14 @@
 #include "media/pusher/pusher_session.h"
 
 #include <iostream>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 
 namespace {
@@ -55,6 +60,15 @@ public:
         ++push_calls;
         last_packet_was_keyframe = packet.keyframe;
         last_packet = packet;
+        if (block_next_push) {
+            std::unique_lock<std::mutex> lock(block_mutex);
+            push_entered = true;
+            block_condition.notify_all();
+            block_condition.wait(lock, [this] { return stop_calls.load() > 0; });
+            block_next_push = false;
+            return PusherResult::Failed(MakeError(PusherErrorCategory::Cancelled,
+                "scripted push interrupted"));
+        }
         if (!opened) {
             return PusherResult::Failed(MakeError(
                 PusherErrorCategory::InvalidState,
@@ -82,6 +96,16 @@ public:
 
     bool IsOpen() const override { return opened; }
 
+    PusherResult RequestStop() override {
+        stop_calls.fetch_add(1);
+        block_condition.notify_all();
+        return PusherResult::Success();
+    }
+
+    void SetEventCallback(EventCallback cb) override { event_callback = std::move(cb); }
+
+    void EmitEvent(const PusherEvent& event) { event_callback(event); }
+
     int open_calls{0};
     int push_calls{0};
     int close_calls{0};
@@ -90,6 +114,12 @@ public:
     bool last_packet_was_keyframe{false};
     std::optional<MediaPacket> last_packet;
     std::optional<PusherError> next_error;
+    std::atomic<int> stop_calls{0};
+    std::mutex block_mutex;
+    std::condition_variable block_condition;
+    bool block_next_push{false};
+    bool push_entered{false};
+    EventCallback event_callback;
 };
 
 bool IsFailedWith(const PusherPublishResult& result,
@@ -346,6 +376,131 @@ int main() {
     std::cout << "Non-Retryable Errors (" << non_retryable_errors.size() << "):" << std::endl;
     for (const auto& err : non_retryable_errors) {
         std::cout << "  - " << err << std::endl;
+    }
+
+    auto event_pusher = std::make_unique<ScriptedPusher>();
+    ScriptedPusher* event_source = event_pusher.get();
+    PusherSession event_session(std::move(event_pusher));
+    if (!event_session.Open(config).Succeed()) return 1;
+    const PusherEvent network_event{
+        PusherEventStage::Write,
+        PusherError{PusherErrorCategory::Network, "scripted async failure", true},
+    };
+    std::thread event_thread([&] { event_source->EmitEvent(network_event); });
+    event_thread.join();
+    {
+        std::unique_lock<std::mutex> lock(event_source->block_mutex);
+        if (!event_source->block_condition.wait_for(lock, std::chrono::seconds(2),
+                [&] { return event_source->stop_calls.load() > 0; })) {
+            std::cerr << "Event thread did not react without a Session call" << std::endl;
+            return 1;
+        }
+    }
+    const auto event_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (event_session.State() != PusherSessionState::Failed &&
+           std::chrono::steady_clock::now() < event_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const auto observed_event = event_session.LastEvent();
+    if (event_session.State() != PusherSessionState::Failed ||
+        !observed_event.has_value() ||
+        observed_event->stage != PusherEventStage::Write ||
+        observed_event->error.category != PusherErrorCategory::Network ||
+        !observed_event->error.retryable ||
+        !IsFailedWith(event_session.Publish(MakeVideoPacket(true)),
+                      PusherErrorCategory::Network) ||
+        event_source->push_calls != 0) {
+        std::cerr << "Structured async event was not handled by Session" << std::endl;
+        return 1;
+    }
+    if (!event_session.Close().Succeed()) return 1;
+    const int stops_after_close = event_source->stop_calls.load();
+    event_source->EmitEvent(network_event);
+    if (!event_session.Open(config).Succeed() ||
+        event_session.State() != PusherSessionState::WaitingForKeyframe ||
+        event_session.LastEvent().has_value() ||
+        event_source->stop_calls.load() != stops_after_close) {
+        std::cerr << "Closed connection event leaked into reopened Session" << std::endl;
+        return 1;
+    }
+    if (!event_session.Close().Succeed()) return 1;
+
+    auto interrupted_pusher = std::make_unique<ScriptedPusher>();
+    ScriptedPusher* interrupted = interrupted_pusher.get();
+    PusherSession interrupted_session(std::move(interrupted_pusher));
+    if (!interrupted_session.Open(config).Succeed()) return 1;
+    interrupted->block_next_push = true;
+    PusherPublishResult interrupted_result;
+    std::thread interrupted_writer([&] {
+        interrupted_result = interrupted_session.Publish(MakeVideoPacket(true));
+    });
+    {
+        std::unique_lock<std::mutex> lock(interrupted->block_mutex);
+        if (!interrupted->block_condition.wait_for(lock, std::chrono::seconds(2),
+                [&] { return interrupted->push_entered; })) {
+            interrupted_session.RequestStop();
+            interrupted_writer.join();
+            std::cerr << "Event interruption test did not reach Push" << std::endl;
+            return 1;
+        }
+    }
+    interrupted->EmitEvent(network_event);
+    {
+        std::unique_lock<std::mutex> lock(interrupted->block_mutex);
+        if (!interrupted->block_condition.wait_for(lock, std::chrono::seconds(2),
+                [&] { return interrupted->stop_calls.load() > 0; })) {
+            interrupted_session.RequestStop();
+            interrupted_writer.join();
+            std::cerr << "Event thread did not interrupt blocked Push" << std::endl;
+            return 1;
+        }
+    }
+    interrupted_writer.join();
+    const auto interrupted_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (interrupted_session.State() != PusherSessionState::Failed &&
+           std::chrono::steady_clock::now() < interrupted_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (interrupted->stop_calls.load() != 1 ||
+        !IsFailedWith(interrupted_result, PusherErrorCategory::Cancelled) ||
+        interrupted_session.State() != PusherSessionState::Failed ||
+        !interrupted_session.LastEvent().has_value()) {
+        std::cerr << "Async event did not interrupt blocked Push" << std::endl;
+        return 1;
+    }
+    if (!interrupted_session.Close().Succeed()) return 1;
+
+    auto blocking_pusher = std::make_unique<ScriptedPusher>();
+    ScriptedPusher* blocking = blocking_pusher.get();
+    PusherSession blocking_session(std::move(blocking_pusher));
+    if (!blocking_session.Open(config).Succeed()) return 1;
+    blocking->block_next_push = true;
+    PusherPublishResult blocked_result;
+    std::thread writer([&] { blocked_result = blocking_session.Publish(MakeVideoPacket(true)); });
+    bool push_entered = false;
+    {
+        std::unique_lock<std::mutex> lock(blocking->block_mutex);
+        push_entered = blocking->block_condition.wait_for(lock, std::chrono::seconds(2),
+            [&] { return blocking->push_entered; });
+    }
+    if (!push_entered) {
+        blocking_session.RequestStop();
+        writer.join();
+        std::cerr << "Scripted Push did not enter the blocking call" << std::endl;
+        return 1;
+    }
+    const auto stop_started = std::chrono::steady_clock::now();
+    const bool stop_ok = blocking_session.RequestStop().Succeed() &&
+                         blocking_session.RequestStop().Succeed();
+    const auto stop_elapsed = std::chrono::steady_clock::now() - stop_started;
+    const auto close_result = blocking_session.Close();
+    writer.join();
+    if (!stop_ok || stop_elapsed > std::chrono::milliseconds(200) ||
+        !close_result.Succeed() || blocking->stop_calls.load() != 2 ||
+        !IsFailedWith(blocked_result, PusherErrorCategory::Cancelled) ||
+        blocking_session.State() != PusherSessionState::Closed) {
+        std::cerr << "RequestStop/Close concurrency contract failed" << std::endl;
+        return 1;
     }
 
     std::cout << "PusherSession test passed" << std::endl;

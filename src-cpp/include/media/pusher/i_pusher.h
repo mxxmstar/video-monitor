@@ -49,6 +49,13 @@ struct PusherResult {
     }
 };
 
+enum class PusherEventStage { Open, Write, Close };
+
+struct PusherEvent {
+    PusherEventStage stage;
+    PusherError error;
+};
+
 
 /// @brief 单个底层输出连接的最小接口。
 ///
@@ -71,9 +78,13 @@ public:
     /// @brief 返回当前输出目标是否已经成功打开。
     virtual bool IsOpen() const = 0;
 
-    /// @brief 输出端事件回调（协议异常等）
-    using EventCallback = std::function<void(const std::string&)>;
+    /// @brief 线程安全、非阻塞且可重复；仅中断 I/O，不释放资源或同步触发事件回调。
+    virtual PusherResult RequestStop() = 0;
 
-    /// @brief 设置事件回调
+    /// @brief 异步错误由 Session 串行处理；同步失败仍通过调用结果返回。
+    using EventCallback = std::function<void(const PusherEvent&)>;
+
+    /// @brief 设置事件回调。Close 后须停止旧连接的异步回调；清空回调返回后
+    /// 不得再调用旧回调，以便 Session 安全析构。
     virtual void SetEventCallback(EventCallback cb) { (void)cb; }
 };

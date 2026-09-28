@@ -2,6 +2,7 @@
 #include <string>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <optional>
 #include <utility>
 #include <map>
@@ -95,7 +96,8 @@ public:
     FFmpegMuxer(const FFmpegMuxer&) = delete;
     FFmpegMuxer& operator=(const FFmpegMuxer&) = delete;
     
-    MuxerResult Open(const MuxerOpenOptions& options, const MediaTrackConfig& config);
+    MuxerResult Open(const MuxerOpenOptions& options, const MediaTrackConfig& config,
+                     std::optional<std::uint64_t> expected_stop_generation = std::nullopt);
 
     /// @brief 参数需由调用方校验；进入 FFmpeg 写入后 AVPacket 被消费，不能重用。
     MuxerResult Write(const MediaPacket& packet);
@@ -104,6 +106,9 @@ public:
 
     /// @brief 请求停止写入
     void RequestStop();
+
+    /// @brief 获取当前代际号
+    std::uint64_t StopGeneration() const { return stop_generation_.load(); }
 
     /// @brief 是否超时
     /// @return true 超时 false 未超时
@@ -126,6 +131,7 @@ private:
 
 
     InterruptContext interrupt_ctx_; ///< 中断回调上下文
+    std::atomic<std::uint64_t> stop_generation_{0}; ///< 停止写入的代际号
 
     std::string output_url_{};     ///< 输出URL
     AVFormatContext* format_ctx_ = nullptr;

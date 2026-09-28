@@ -78,3 +78,11 @@ PublisherState Publisher::State() const noexcept {
     
     return PublisherState::Failed;
 }
+
+PusherResult Publisher::RequestStop() {
+    if (!session_) {
+        return PusherResult::Failed(MakeError(PusherErrorCategory::Internal,
+            "Publisher has no PusherSession implementation"));
+    }
+    return session_->RequestStop();
+}

@@ -2,7 +2,12 @@
 
 #include <memory>
 #include <optional>
+#include <atomic>
+#include <cstdint>
+#include <mutex>
+#include <thread>
 
+#include "common/queue/blocking_mpmc_queue.h"
 #include "media/pusher/i_pusher.h"
 
 enum class PusherTimestampMode {
@@ -98,6 +103,7 @@ struct PusherPublishResult {
 /// 3. 按时间轴策略保留时间戳或从首个接纳包建立 epoch；
 /// 4. 首个关键帧成功写入后进入 Running；
 /// 5. 底层写入失败后停止继续写入。
+/// Publish 仍同步写入；独立事件线程只处理 Pusher 的异步错误。
 /// 待实现：自动重连、退避和多轨同步。
 class PusherSession {
 public:
@@ -121,14 +127,36 @@ public:
     PusherResult Close();
 
     /// @brief 当前会话状态。
-    PusherSessionState State() const noexcept { return state_; }
+    PusherSessionState State() const;
+
+    std::optional<PusherEvent> LastEvent() const;
+
+    /// @brief 请求结束当前输出会话。
+    PusherResult RequestStop();
 
 private:
     PusherPublishResult forwardAcceptedPacket(const MediaPacket& packet);
     PusherResult applyPusherTimestampPolicy(MediaPacket& packet);
     static PusherError MakeError(PusherErrorCategory category, const char* message);
+    void eventLoop();
+
+    struct QueuedEvent {
+        PusherEvent event;  ///< 事件数据
+        std::uint64_t generation;  ///< 事件代际
+    };
 
     std::unique_ptr<IPusher> pusher_;
+    mutable std::recursive_mutex operation_mutex_;  ///< 串行化 Open/Push/Close 与资源访问
+    std::mutex event_mutex_;     ///< 事件队列互斥锁
+    BlockingMpmcQueue<std::optional<QueuedEvent>> event_queue_;  ///< 事件队列
+    /// @brief 事件代际，用于区分不同会话的事件队列
+    /// @details 在 Open 和 Close 之间递增，防止过期事件影响新会话。
+    std::uint64_t event_generation_{0};  ///< 事件代际，用于区分不同会话的事件队列
+    bool event_active_{false};  ///< 事件线程是否正在运行
+    bool event_thread_stopping_{false};  ///< 是否正在停止事件线程
+    std::thread event_thread_;
+    std::optional<PusherEvent> last_event_;  ///< 最后处理的事件
+    std::atomic<bool> stop_requested_{false};   ///< 是否请求停止会话
     PusherSessionState state_{PusherSessionState::Closed};
     PusherTimestampPolicy timestamp_policy_{};
     /// @brief 时间戳基准点，用于后续包的时间戳归一化或偏移计算

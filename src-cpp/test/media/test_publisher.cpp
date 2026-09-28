@@ -80,6 +80,8 @@ public:
 
     bool IsOpen() const override { return opened; }
 
+    PusherResult RequestStop() override { return PusherResult::Success(); }
+
     int open_calls{0};
     int push_calls{0};
     int close_calls{0};

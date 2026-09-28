@@ -34,8 +34,9 @@ FFmpegMuxer::~FFmpegMuxer() {
 
 
 
-MuxerResult FFmpegMuxer::Open(const MuxerOpenOptions& options,
-                              const MediaTrackConfig& config) {
+MuxerResult FFmpegMuxer::Open(const MuxerOpenOptions& options, const MediaTrackConfig& config,
+                              std::optional<std::uint64_t> expected_stop_generation) {
+    const auto stop_generation = expected_stop_generation.value_or(stop_generation_.load());
     // Open 可以重复调用。先关闭旧的输出，保证旧的 AVIO 和 AVFormatContext
     // 不会泄漏，也避免新的 stream 挂到旧 context 上。
     const auto close_result = Close();
@@ -43,6 +44,11 @@ MuxerResult FFmpegMuxer::Open(const MuxerOpenOptions& options,
 
     io_ = options.io;
     interrupt_ctx_.stop_requested.store(false);
+    // 有另外的线程请求停止写入，直接返回
+    if (stop_generation_.load() != stop_generation) {
+        interrupt_ctx_.stop_requested.store(true);
+        return failure(MuxerOperation::OpenIo, MuxerErrorCategory::Cancelled, AVERROR_EXIT);
+    }
     interrupt_ctx_.timed_out.store(false);
     output_url_ = options.output_url;
 
@@ -251,6 +257,8 @@ MuxerResult FFmpegMuxer::Write(const MediaPacket& packet) {
 }
 
 void FFmpegMuxer::RequestStop() {
+    // 请求停止写入，更新代际号并设置中断标志
+    stop_generation_.fetch_add(1);
     interrupt_ctx_.stop_requested.store(true);
 }
 
