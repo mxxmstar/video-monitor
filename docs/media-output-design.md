@@ -319,7 +319,7 @@ public:
 - 非关键视频包被丢弃，并返回明确的 `AwaitingKeyframe` 结果；
 - 第一个关键帧写入成功后进入 `Running`；
 - `Close()` 幂等；
-- Pusher 写入失败后进入 `Failed`，暂时不自动重连。
+- Pusher 发生可重连写入失败后按配置执行重连；失败包不重发，重连成功后等待新的关键帧。
 
 时间戳归零也放在这一层，因为它是输出会话策略，而不是 FFmpeg 封装规则：
 
@@ -337,7 +337,7 @@ session_pts = packet_pts - first_packet_pts
 - 写入失败后不会继续向失效 Pusher 写包；
 - Session 测试可以使用脚本 Pusher，不依赖真实 RTSP。
 
-暂不做：自动重连、DTS 交织、多轨等待。
+暂不做：DTS 交织、多轨等待。
 
 ### 阶段 4：实现 Publisher 门面
 
@@ -490,7 +490,7 @@ RTSP Server 路线的实现顺序：
 
 本节是下一轮实现计划，更新第 7 节的推进顺序；结构体和示例均为拟议接口，
 不表示当前代码已经支持这些配置或完成 ZLMediaKit 联调。
-下一步先补齐输出配置，再验证网络推流，之后实现 Session 自动重连。
+输出配置、网络推流和 Session 自动重连均由当前实现覆盖，后续继续补充真实断线联调。
 
 ### 8.1 对齐 Puller 的组织方式
 
@@ -696,11 +696,11 @@ ZLMediaKit 是远端服务，不作为 Pusher 的新后端类型。
 5. 回归与联调：先通过本地 MP4、时间戳和 Session 测试，再分别验证 ZLMediaKit
    RTSP/TCP、RTMP 的单路 H.264 发布与播放；加入连接拒绝、认证拒绝、
    服务端断开以及可控本地测试服务制造的超时测试。
-6. 后续扩展：网络推流基线通过后，再增加 Session 重连配置与退避状态机，
-   然后扩展 SRT、TLS 专用参数、音频及多轨。
+6. 后续扩展：在现有 Session 重连配置与退避状态机基础上，继续扩展 SRT、
+   TLS 专用参数、音频及多轨。
 
-重连配置只加入 PusherSessionConfig，建议后续提供 enabled、
-max_reconnect_attempts、initial_delay、max_delay 和 backoff_multiplier。
+重连配置只加入 PusherSessionConfig，当前提供 enabled、max_attempts、
+initial_delay、max_delay、multiplier 和 reset_after_stable。
 消费式写包失败后不重发原包；重连成功后等待新关键帧。
 重连机制不能替代本阶段的格式、选项和媒体参数校验。
 
@@ -727,7 +727,7 @@ PTS/DTS 建立 epoch，并要求该策略下的 packet 使用输出轨道声明�
 不同刻度的整数 timestamp 被静默相减。网络输出默认保留连续时间轴，避免重连
 或多个输出目标各自猜测偏移量。
 
-当前尚未实现自动重连；`TimestampEpochScope` 仅预留重连加入后的 epoch
+PusherSession 已实现自动重连；`TimestampEpochScope` 控制重连后的 epoch
 生命周期：`Session` 沿用 epoch，`Connection` 在新连接的首包重新建立 epoch。
 当前 `Open()` 与成功的 `Close()` 都会清除 epoch。
 
@@ -774,8 +774,8 @@ Session 内分别串行，`Close()` 等待正在执行的写入结束，再返�
 中断阻塞 I/O，再与同步
 `Open/Publish/Close` 串行更新会话状态和 `LastEvent()`。事件无需等待下次
 `State()` 或 `Publish()` 才生效。关闭和重开会更新连接代次，丢弃旧连接的
-迟到事件；析构时注销回调并停止、等待事件线程退出。当前 FFmpeg 输出只通过
-同步调用结果报告错误，没有独立的异步事件源，也未实现自动重连。
+迟到事件；析构时注销回调并停止、等待事件线程退出。同步写入错误和结构化异步
+事件都由 PusherSession 使用同一套重连策略处理。
 
 当前同步 `Publish()` 明确会把网络写入背压传给调用线程。以后若增加队列，队列
 归 Session 所有，需在配置中定义容量、满队列策略、停止时丢弃规则和统计口径；

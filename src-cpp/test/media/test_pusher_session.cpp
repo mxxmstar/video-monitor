@@ -52,6 +52,18 @@ public:
                 PusherErrorCategory::InvalidConfiguration,
                 "scripted pusher received invalid config"));
         }
+        if (fail_next_open_count > 0) {
+            --fail_next_open_count;
+            opened = false;
+            return PusherResult::Failed(PusherError{
+                PusherErrorCategory::OpenFailed, "scripted open failed", true});
+        }
+        if (next_open_error.has_value()) {
+            opened = false;
+            auto error = std::move(*next_open_error);
+            next_open_error.reset();
+            return PusherResult::Failed(std::move(error));
+        }
         opened = true;
         return PusherResult::Success();
     }
@@ -76,9 +88,8 @@ public:
         }
         if (fail_next_push) {
             fail_next_push = false;
-            return PusherResult::Failed(MakeError(
-                PusherErrorCategory::WriteFailed,
-                "scripted write failed"));
+            return PusherResult::Failed(PusherError{
+                PusherErrorCategory::WriteFailed, "scripted write failed", true});
         }
         if (next_error) {
             auto error = std::move(*next_error);
@@ -106,14 +117,16 @@ public:
 
     void EmitEvent(const PusherEvent& event) { event_callback(event); }
 
-    int open_calls{0};
+    std::atomic<int> open_calls{0};
     int push_calls{0};
-    int close_calls{0};
+    std::atomic<int> close_calls{0};
     bool opened{false};
     bool fail_next_push{false};
+    int fail_next_open_count{0};
     bool last_packet_was_keyframe{false};
     std::optional<MediaPacket> last_packet;
     std::optional<PusherError> next_error;
+    std::optional<PusherError> next_open_error;
     std::atomic<int> stop_calls{0};
     std::mutex block_mutex;
     std::condition_variable block_condition;
@@ -145,6 +158,7 @@ int main() {
 
     PusherSessionConfig config;
     config.pusher = MakeValidConfig();
+    config.reconnect_policy.enabled = false;
     if (!session.Open(config).Succeed() ||
         session.State() != PusherSessionState::WaitingForKeyframe ||
         scripted->open_calls != 1) {
@@ -313,6 +327,115 @@ int main() {
         return 1;
     }
 
+    if (!IsRetryablePusherError(PusherErrorCategory::OpenFailed) ||
+        !IsRetryablePusherError(PusherErrorCategory::WriteFailed) ||
+        !IsRetryablePusherError(PusherErrorCategory::Timeout) ||
+        !IsRetryablePusherError(PusherErrorCategory::Network) ||
+        IsRetryablePusherError(PusherErrorCategory::InvalidPacket) ||
+        IsRetryablePusherError(PusherErrorCategory::CloseFailed)) {
+        std::cerr << "Pusher error retryability classification is incorrect" << std::endl;
+        return 1;
+    }
+
+    // 可重试写失败会关闭旧连接并重新 Open；失败包不重发，重连后等待关键帧。
+    auto reconnect_pusher = std::make_unique<ScriptedPusher>();
+    ScriptedPusher* const reconnecting = reconnect_pusher.get();
+    PusherSession reconnecting_session(std::move(reconnect_pusher));
+    PusherSessionConfig reconnect_config = config;
+    reconnect_config.reconnect_policy.enabled = true;
+    reconnect_config.reconnect_policy.initial_delay = std::chrono::milliseconds(0);
+    reconnect_config.reconnect_policy.max_attempts = 1;
+    if (!reconnecting_session.Open(reconnect_config).Succeed()) {
+        std::cerr << "Failed to open reconnecting session" << std::endl;
+        return 1;
+    }
+    reconnecting->fail_next_push = true;
+    if (!IsFailedWith(reconnecting_session.Publish(MakeVideoPacket(true)),
+                      PusherErrorCategory::WriteFailed) ||
+        reconnecting_session.State() != PusherSessionState::WaitingForKeyframe ||
+        reconnecting->open_calls != 2 || reconnecting->push_calls != 1) {
+        std::cerr << "PusherSession did not recover after a retryable write failure"
+                  << std::endl;
+        return 1;
+    }
+    if (!reconnecting_session.Publish(MakeVideoPacket(false)).Succeed() ||
+        reconnecting->push_calls != 1) {
+        std::cerr << "PusherSession wrote a non-keyframe during reconnect" << std::endl;
+        return 1;
+    }
+    if (!reconnecting_session.Publish(MakeVideoPacket(true)).WasPublished() ||
+        reconnecting_session.State() != PusherSessionState::Running ||
+        reconnecting->push_calls != 2 ||
+        !reconnecting_session.Close().Succeed()) {
+        std::cerr << "PusherSession did not resume on the next keyframe" << std::endl;
+        return 1;
+    }
+
+    auto waiting_pusher = std::make_unique<ScriptedPusher>();
+    ScriptedPusher* const waiting = waiting_pusher.get();
+    PusherSession waiting_session(std::move(waiting_pusher));
+    PusherSessionConfig waiting_config = reconnect_config;
+    waiting_config.reconnect_policy.initial_delay = std::chrono::milliseconds(750);
+    if (!waiting_session.Open(waiting_config).Succeed()) return 1;
+    waiting->fail_next_push = true;
+    PusherPublishResult waiting_result;
+    std::thread waiting_writer([&] {
+        waiting_result = waiting_session.Publish(MakeVideoPacket(true));
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (waiting->close_calls.load() == 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const auto stopped_at = std::chrono::steady_clock::now();
+    waiting_session.RequestStop();
+    waiting_writer.join();
+    if (waiting->close_calls.load() != 1 || waiting->open_calls.load() != 1 ||
+        !IsFailedWith(waiting_result, PusherErrorCategory::Cancelled) ||
+        std::chrono::steady_clock::now() - stopped_at > std::chrono::milliseconds(200) ||
+        !waiting_session.Close().Succeed()) {
+        std::cerr << "Stop did not interrupt reconnect backoff" << std::endl;
+        return 1;
+    }
+
+    auto retry_pusher = std::make_unique<ScriptedPusher>();
+    ScriptedPusher* const retrying = retry_pusher.get();
+    PusherSession retry_session(std::move(retry_pusher));
+    PusherSessionConfig retry_config = reconnect_config;
+    retry_config.reconnect_policy.max_attempts = 2;
+    retry_config.reconnect_policy.initial_delay = std::chrono::milliseconds(10);
+    retry_config.reconnect_policy.multiplier = 2.0;
+    if (!retry_session.Open(retry_config).Succeed()) return 1;
+    retrying->fail_next_push = true;
+    retrying->fail_next_open_count = 1;
+    const auto retry_started = std::chrono::steady_clock::now();
+    const auto retry_result = retry_session.Publish(MakeVideoPacket(true));
+    if (!IsFailedWith(retry_result, PusherErrorCategory::WriteFailed) ||
+        retry_session.State() != PusherSessionState::WaitingForKeyframe ||
+        retrying->open_calls.load() != 3 || retrying->push_calls != 1 ||
+        std::chrono::steady_clock::now() - retry_started < std::chrono::milliseconds(25) ||
+        !retry_session.Publish(MakeVideoPacket(true)).WasPublished() ||
+        !retry_session.Close().Succeed()) {
+        std::cerr << "PusherSession did not retry Open with backoff" << std::endl;
+        return 1;
+    }
+
+    auto rejected_pusher = std::make_unique<ScriptedPusher>();
+    ScriptedPusher* const rejected = rejected_pusher.get();
+    PusherSession rejected_session(std::move(rejected_pusher));
+    if (!rejected_session.Open(reconnect_config).Succeed()) return 1;
+    rejected->fail_next_push = true;
+    rejected->next_open_error = PusherError{
+        PusherErrorCategory::Authentication, "scripted authentication failed", false};
+    if (!IsFailedWith(rejected_session.Publish(MakeVideoPacket(true)),
+                      PusherErrorCategory::Authentication) ||
+        rejected_session.State() != PusherSessionState::Failed ||
+        rejected->open_calls.load() != 2 ||
+        !rejected_session.Close().Succeed()) {
+        std::cerr << "PusherSession lost the terminal reconnect error" << std::endl;
+        return 1;
+    }
+
     // 错误分类测试
     std::vector<std::string> retryable_errors;
     std::vector<std::string> non_retryable_errors;
@@ -414,6 +537,29 @@ int main() {
         return 1;
     }
     if (!event_session.Close().Succeed()) return 1;
+
+    auto async_pusher = std::make_unique<ScriptedPusher>();
+    ScriptedPusher* const async_source = async_pusher.get();
+    PusherSession async_session(std::move(async_pusher));
+    if (!async_session.Open(reconnect_config).Succeed() ||
+        !async_session.Publish(MakeVideoPacket(true)).WasPublished()) return 1;
+    async_source->EmitEvent(network_event);
+    const auto async_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (async_source->open_calls.load() < 2 &&
+           std::chrono::steady_clock::now() < async_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (async_source->open_calls.load() != 2 ||
+        async_session.State() != PusherSessionState::WaitingForKeyframe ||
+        async_session.Publish(MakeVideoPacket(false)).status !=
+            PusherPublishStatus::DroppedAwaitingKeyframe ||
+        !async_session.Publish(MakeVideoPacket(true)).WasPublished() ||
+        async_session.State() != PusherSessionState::Running ||
+        !async_session.Close().Succeed()) {
+        std::cerr << "Async event did not recover on the next keyframe" << std::endl;
+        return 1;
+    }
+
     const int stops_after_close = event_source->stop_calls.load();
     event_source->EmitEvent(network_event);
     if (!event_session.Open(config).Succeed() ||

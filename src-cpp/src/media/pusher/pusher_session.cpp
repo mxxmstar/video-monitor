@@ -1,5 +1,7 @@
 #include "media/pusher/pusher_session.h"
 
+#include <algorithm>
+#include <cmath>
 #include <limits>
 #include <memory>
 #include <utility>
@@ -82,6 +84,7 @@ PusherResult PusherSession::Open(const PusherSessionConfig& config) {
             return close_result;
         }
     }
+    stop_requested_.store(false);
 
     if (!pusher_) {
         state_ = PusherSessionState::Failed;
@@ -94,13 +97,16 @@ PusherResult PusherSession::Open(const PusherSessionConfig& config) {
             "PusherSession received an invalid output configuration"));
     }
 
-    stop_requested_.store(false);
+    reconnect_policy_ = config.reconnect_policy;
+    pusher_config_ = config.pusher;
     {
         std::lock_guard<std::mutex> event_lock(event_mutex_);
         ++event_generation_;
         event_active_ = true;
     }
     last_event_.reset();
+    terminal_error_.reset();
+    failed_from_event_ = false;
     const PusherResult open_result = pusher_->Open(config.pusher);
     if (!open_result.Succeed()) {
         {
@@ -123,26 +129,35 @@ PusherResult PusherSession::Open(const PusherSessionConfig& config) {
     timestamp_epoch_.reset();
     timestamp_time_base_ = Rational{config.pusher.video_track.time_base_num,
                                     config.pusher.video_track.time_base_den};
+    reconnect_attempts_ = 0;
+    connected_since_ = std::chrono::steady_clock::now();
     return PusherResult::Success();
 }
 
 PusherPublishResult PusherSession::Publish(const MediaPacket& packet) {
     std::lock_guard<std::recursive_mutex> lock(operation_mutex_);
-    if (stop_requested_.load()) {
-        return PusherPublishResult::Failed(MakeError(PusherErrorCategory::Cancelled,
-            "PusherSession has been asked to stop"));
-    }
     if (state_ == PusherSessionState::Closed) {
         return PusherPublishResult::Failed(MakeError(PusherErrorCategory::InvalidState,
             "PusherSession::Publish called before a successful Open"));
     }
+    if (stop_requested_.load()) {
+        return PusherPublishResult::Failed(MakeError(PusherErrorCategory::Cancelled,
+            "PusherSession has been asked to stop"));
+    }
 
     if (state_ == PusherSessionState::Failed) {
-        if (last_event_.has_value()) {
-            return PusherPublishResult::Failed(last_event_->error);
+        if (failed_from_event_ && terminal_error_.has_value()) {
+            return PusherPublishResult::Failed(*terminal_error_);
         }
         return PusherPublishResult::Failed(MakeError(PusherErrorCategory::InvalidState,
             "PusherSession is failed; close and open it before publishing again"));
+    }
+
+    // 重连策略：稳定一段时间后（reset_after_stable）则重置重连次数和连接开始时间。
+    if (reconnect_attempts_ > 0 && reconnect_policy_.reset_after_stable.count() > 0 &&
+        std::chrono::steady_clock::now() - connected_since_ >= reconnect_policy_.reset_after_stable) {
+        reconnect_attempts_ = 0;
+        connected_since_ = std::chrono::steady_clock::now();
     }
 
     // 初版 session 只建立一条 H.264 视频轨道。
@@ -182,27 +197,39 @@ PusherPublishResult PusherSession::forwardAcceptedPacket(const MediaPacket& pack
 
     const PusherResult push_result = pusher_->Push(output_packet);
     if (!push_result.Succeed()) {
-        // InvalidPacket 等调用方输入错误不会破坏已经打开的输出容器，等待
-        // 下一包仍然合理；底层超时、网络、取消等错误均使当前会话失效。
-        if (push_result.error.has_value() &&
-            push_result.error->category != PusherErrorCategory::InvalidPacket &&
-            push_result.error->category != PusherErrorCategory::UnsupportedMedia) {
-            state_ = PusherSessionState::Failed;
-        }
-
         if (push_result.error.has_value()) {
+            const PusherError& error = *push_result.error;
+            if (IsRetryablePusherError(error.category) && error.retryable) {
+                const PusherResult reconnect_result = tryReconnectLocked(error);
+                if (reconnect_result.Succeed()) {
+                    return PusherPublishResult::Failed(error);
+                }
+                state_ = PusherSessionState::Failed;
+                terminal_error_ = *reconnect_result.error;
+                return PusherPublishResult::Failed(*terminal_error_);
+            }
+            if (stop_requested_.load()) {
+                state_ = PusherSessionState::Failed;
+                terminal_error_ = MakeError(PusherErrorCategory::Cancelled, "PusherSession stopped during Publish");
+                return PusherPublishResult::Failed(*terminal_error_);
+            }
+            if (error.category != PusherErrorCategory::InvalidPacket && error.category != PusherErrorCategory::UnsupportedMedia) {
+                state_ = PusherSessionState::Failed;
+                terminal_error_ = error;
+            }
             return PusherPublishResult::Failed(*push_result.error);
         }
 
-        return PusherPublishResult::Failed(MakeError(PusherErrorCategory::Internal,
-            "Pusher returned a failed result without an error"));
+        state_ = PusherSessionState::Failed;
+        terminal_error_ = MakeError(PusherErrorCategory::Internal, "Pusher returned a failed result without an error");
+        return PusherPublishResult::Failed(*terminal_error_);
     }
     if (stop_requested_.load()) {
         return PusherPublishResult::Failed(MakeError(PusherErrorCategory::Cancelled,
             "PusherSession stopped during Publish"));
     }
     if (state_ == PusherSessionState::Failed) {
-        return PusherPublishResult::Failed(last_event_->error);
+        return PusherPublishResult::Failed(*terminal_error_);
     }
 
     if (state_ == PusherSessionState::WaitingForKeyframe) {
@@ -260,6 +287,8 @@ PusherResult PusherSession::applyPusherTimestampPolicy(MediaPacket& packet) {
 }
 
 PusherResult PusherSession::Close() {
+    stop_requested_.store(true);
+    reconnect_wait_cv_.notify_all();
     std::lock_guard<std::recursive_mutex> lock(operation_mutex_);
     {
         std::lock_guard<std::mutex> event_lock(event_mutex_);
@@ -292,10 +321,98 @@ PusherResult PusherSession::Close() {
 
 PusherResult PusherSession::RequestStop() {
     stop_requested_.store(true);
+    reconnect_wait_cv_.notify_all();
     if (!pusher_) {
         return PusherResult::Success();
     }
     return pusher_->RequestStop();
+}
+
+PusherResult PusherSession::tryReconnectLocked(const PusherError& cause) {
+    if (!reconnect_policy_.enabled || !cause.retryable || !IsRetryablePusherError(cause.category)) {
+        return PusherResult::Failed(cause);
+    }
+
+    PusherError last_error = cause;
+    while (!stop_requested_.load()) {
+        if (reconnect_policy_.max_attempts >= 0 && reconnect_attempts_ >= reconnect_policy_.max_attempts) {
+            return PusherResult::Failed(last_error);
+        }
+
+        ++reconnect_attempts_;
+        const auto delay = reconnectDelay(reconnect_policy_, reconnect_attempts_);
+        {
+            std::lock_guard<std::mutex> event_lock(event_mutex_);
+            event_active_ = false;
+            ++event_generation_;
+        }
+        (void)pusher_->Close();
+        if (!waitForReconnectDelay(delay)) {
+            return PusherResult::Failed(MakeError(PusherErrorCategory::Cancelled,
+                "PusherSession stopped during reconnect"));
+        }
+
+        const PusherResult open_result = pusher_->Open(pusher_config_);
+        if (open_result.Succeed()) {
+            {
+                std::lock_guard<std::mutex> event_lock(event_mutex_);
+                event_active_ = true;
+            }
+            state_ = PusherSessionState::WaitingForKeyframe;
+            if (timestamp_policy_.scope == PusherTimestampEpochScope::Connection) {
+                timestamp_epoch_.reset();
+            }
+            connected_since_ = std::chrono::steady_clock::now();
+            terminal_error_.reset();
+            failed_from_event_ = false;
+            return PusherResult::Success();
+        }
+
+        if (!open_result.error.has_value() ||
+            !open_result.error->retryable ||
+            !IsRetryablePusherError(open_result.error->category)) {
+            return open_result;
+        }
+        last_error = *open_result.error;
+    }
+
+    return PusherResult::Failed(MakeError(PusherErrorCategory::Cancelled,
+        "PusherSession stopped during reconnect"));
+}
+
+std::chrono::milliseconds PusherSession::reconnectDelay(
+    const PusherReconnectPolicy& config, int reconnect_attempt) {
+    if (config.initial_delay.count() <= 0) {
+        return std::chrono::milliseconds::zero();
+    }
+
+    const double multiplier = std::isfinite(config.multiplier)
+        ? std::max(config.multiplier, 1.0) : 1.0;
+    const int multiplier_count = std::max(reconnect_attempt - 1, 0);
+    long double delay_ms = static_cast<long double>(config.initial_delay.count());
+    const long double max_duration = static_cast<long double>(
+        (std::numeric_limits<std::chrono::milliseconds::rep>::max)());
+    for (int index = 0; index < multiplier_count && delay_ms < max_duration; ++index) {
+        delay_ms = std::min(delay_ms * multiplier, max_duration);
+    }
+    if (config.max_delay.count() > 0) {
+        delay_ms = std::min(delay_ms,
+            static_cast<long double>(config.max_delay.count()));
+    }
+    return std::chrono::milliseconds(
+        static_cast<std::chrono::milliseconds::rep>(delay_ms));
+}
+
+bool PusherSession::waitForReconnectDelay(std::chrono::milliseconds delay) {
+    if (delay.count() <= 0) {
+        return !stop_requested_.load();
+    }
+
+    std::unique_lock<std::mutex> lock(reconnect_wait_mutex_);
+    const bool stopped = reconnect_wait_cv_.wait_for(lock, delay, [this] {
+        return stop_requested_.load();
+    });
+    return !stopped;
 }
 
 void PusherSession::eventLoop() {
@@ -317,16 +434,27 @@ void PusherSession::eventLoop() {
         }
 
         std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
-        std::lock_guard<std::mutex> event_lock(event_mutex_);
-        if (!event_active_ || queued->generation != event_generation_) {
-            continue;  // 事件代际过期不匹配，跳过
+        {
+            std::lock_guard<std::mutex> event_lock(event_mutex_);
+            if (!event_active_ || queued->generation != event_generation_) {
+                continue;
+            }
+            last_event_ = std::move(queued->event);
         }
-        // 更新事件记录和状态
-        last_event_ = std::move(queued->event);
-        if (state_ != PusherSessionState::Closed &&
-            !(stop_requested_.load() && last_event_->error.category == PusherErrorCategory::Cancelled)) {
-            state_ = PusherSessionState::Failed;
+        if (state_ == PusherSessionState::Closed) {
+            continue;
         }
+        if (stop_requested_.load() &&
+            last_event_->error.category == PusherErrorCategory::Cancelled) {
+            continue;
+        }
+        const PusherResult reconnect_result = tryReconnectLocked(last_event_->error);
+        if (reconnect_result.Succeed()) {
+            continue;
+        }
+        state_ = PusherSessionState::Failed;
+        terminal_error_ = reconnect_result.error;
+        failed_from_event_ = true;
     }
 }
 

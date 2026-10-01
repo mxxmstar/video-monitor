@@ -9,8 +9,13 @@
 namespace {
 
 /// @brief 统一构造 Pusher 失败结果，避免每个分支遗漏错误分类。
-PusherResult MakeFailure(PusherErrorCategory category, std::string message, bool retryable = false) {
+PusherResult MakeFailure(PusherErrorCategory category, std::string message,
+                         bool retryable) {
     return PusherResult::Failed(PusherError{category, std::move(message), retryable});
+}
+
+PusherResult MakeFailure(PusherErrorCategory category, std::string message) {
+    return MakeFailure(category, std::move(message), IsRetryablePusherError(category));
 }
 
 std::string ToLowerAscii(std::string value) {

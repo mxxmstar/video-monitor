@@ -27,6 +27,7 @@ PublisherConfig MakeValidPublisherConfig() {
     PublisherConfig config;
     config.kind = PublisherKind::Client;
     config.session.pusher = MakeValidPusherConfig();
+    config.session.reconnect_policy.enabled = false;
     return config;
 }
 

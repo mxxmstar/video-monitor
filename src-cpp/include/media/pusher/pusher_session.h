@@ -3,7 +3,9 @@
 #include <memory>
 #include <optional>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <condition_variable>
 #include <mutex>
 #include <thread>
 
@@ -25,6 +27,17 @@ struct PusherTimestampPolicy {
     PusherTimestampEpochScope scope{PusherTimestampEpochScope::Session};
 };
 
+/// @brief PusherSession 重连策略
+struct PusherReconnectPolicy {
+    bool enabled{true};   ///< 是否启用重连策略
+    int max_attempts{-1};   ///< 最大重连次数，-1 表示无限重连
+    std::chrono::milliseconds initial_delay{3000};   ///< 初始重连延迟
+    double multiplier{1.0};   ///< 重连延迟倍数
+    std::chrono::milliseconds max_delay{3000};   ///< 最大重连延迟
+    std::chrono::milliseconds reset_after_stable{30000};   ///< 重置重连策略时间间隔
+};
+
+
 /// @brief 一次输出会话的状态。
 ///
 /// 初版只有同步写入，因此不引入 Opening、Stopping 等瞬时状态。后续加入
@@ -43,6 +56,7 @@ enum class PusherSessionState {
 struct PusherSessionConfig {
     PusherConfig pusher;
     PusherTimestampPolicy timestamp_policy;
+    PusherReconnectPolicy reconnect_policy;
 
     bool is_valid() const { return pusher.is_valid(); }
 };
@@ -102,9 +116,10 @@ struct PusherPublishResult {
 /// 2. 丢弃等待期间的非关键视频包；
 /// 3. 按时间轴策略保留时间戳或从首个接纳包建立 epoch；
 /// 4. 首个关键帧成功写入后进入 Running；
-/// 5. 底层写入失败后停止继续写入。
+/// 5. 底层发生可重连错误时关闭旧连接并按策略重开；失败包不重发；
+/// 6. 重连成功后回到 WaitingForKeyframe，等待新的关键帧恢复输出。
 /// Publish 仍同步写入；独立事件线程只处理 Pusher 的异步错误。
-/// 待实现：自动重连、退避和多轨同步。
+/// 多轨同步仍待实现。
 class PusherSession {
 public:
     /// @brief 创建默认使用 FFmpegPusher 的输出会话。
@@ -137,6 +152,9 @@ public:
 private:
     PusherPublishResult forwardAcceptedPacket(const MediaPacket& packet);
     PusherResult applyPusherTimestampPolicy(MediaPacket& packet);
+    PusherResult tryReconnectLocked(const PusherError& cause);
+    static std::chrono::milliseconds reconnectDelay(const PusherReconnectPolicy& config, int reconnect_attempt);
+    bool waitForReconnectDelay(std::chrono::milliseconds delay);
     static PusherError MakeError(PusherErrorCategory category, const char* message);
     void eventLoop();
 
@@ -156,6 +174,8 @@ private:
     bool event_thread_stopping_{false};  ///< 是否正在停止事件线程
     std::thread event_thread_;
     std::optional<PusherEvent> last_event_;  ///< 最后处理的事件
+    std::optional<PusherError> terminal_error_;  ///< 当前 Failed 状态的原因
+    bool failed_from_event_{false};  ///< 是否从事件线程失败
     std::atomic<bool> stop_requested_{false};   ///< 是否请求停止会话
     PusherSessionState state_{PusherSessionState::Closed};
     PusherTimestampPolicy timestamp_policy_{};
@@ -163,4 +183,12 @@ private:
     std::optional<std::int64_t> timestamp_epoch_;
     /// @brief 时间戳时间基，用于后续包的时间戳单位转换
     std::optional<Rational> timestamp_time_base_;
+
+    /// @brief 重连策略
+    PusherReconnectPolicy reconnect_policy_{};
+    PusherConfig pusher_config_{};
+    int reconnect_attempts_{0};  ///< 当前重连尝试次数
+    std::chrono::steady_clock::time_point connected_since_{};  ///< 连接开始时间
+    std::mutex reconnect_wait_mutex_;  ///< 重连等待互斥锁
+    std::condition_variable reconnect_wait_cv_;  ///< 重连等待条件变量
 };

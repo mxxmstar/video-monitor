@@ -28,6 +28,18 @@ enum class PusherErrorCategory {
     CloseFailed,
 };
 
+inline bool IsRetryablePusherError(PusherErrorCategory category) {
+    switch (category) {
+    case PusherErrorCategory::OpenFailed:
+    case PusherErrorCategory::WriteFailed:
+    case PusherErrorCategory::Timeout:
+    case PusherErrorCategory::Network:
+        return true;
+    default:
+        return false;
+    }
+}
+
 /// @brief Pusher 对外暴露的结构化错误。
 struct PusherError {
     PusherErrorCategory category;  ///< 错误分类
