@@ -1,8 +1,17 @@
 #include "media/publisher/publisher.h"
+#include "media/ffmpeg_packet_buffer.h"
 
+#include <chrono>
+#include <cstring>
 #include <iostream>
 #include <memory>
+#include <stdexcept>
+#include <thread>
 #include <utility>
+
+extern "C" {
+#include <libavcodec/packet.h>
+}
 
 namespace {
 
@@ -36,6 +45,27 @@ MediaPacket MakeVideoPacket(bool keyframe) {
     packet.type = MediaType::VIDEO;
     packet.codec = CodecType::H264;
     packet.keyframe = keyframe;
+    return packet;
+}
+
+MediaPacket MakeEncodedVideoPacket(bool keyframe) {
+    AVPacket* raw = av_packet_alloc();
+    if (!raw || av_new_packet(raw, 4) < 0) {
+        if (raw) {
+            av_packet_free(&raw);
+        }
+        throw std::runtime_error("failed to allocate encoded test packet");
+    }
+    std::memset(raw->data, 0, static_cast<std::size_t>(raw->size));
+
+    MediaPacket packet = MakeVideoPacket(keyframe);
+    packet.pts = 0;
+    packet.dts = 0;
+    packet.duration = 1;
+    packet.time_base = {1, 25};
+    packet.buffer = std::make_shared<FFmpegPacketBuffer>(raw);
+    packet.backend.type = BackendHandle::FFMPEG;
+    packet.backend.ptr = raw;
     return packet;
 }
 
@@ -161,6 +191,38 @@ int main() {
         publisher.State() != PublisherState::Closed ||
         scripted->close_calls != 1) {
         std::cerr << "Publisher Close is not idempotent" << std::endl;
+        return 1;
+    }
+
+    // 同步 Publisher 只接受 Publish；异步模式由配置选择，并只接受 Enqueue。
+    auto async_scripted_pusher = std::make_unique<ScriptedPusher>();
+    ScriptedPusher* const async_scripted = async_scripted_pusher.get();
+    auto async_session = std::make_unique<AsyncPusherSession>(
+        std::make_unique<PusherSession>(std::move(async_scripted_pusher)));
+    Publisher async_publisher(std::move(async_session));
+    PublisherConfig async_config = MakeValidPublisherConfig();
+    async_config.session.mode = PusherSessionMode::Asynchronous;
+    async_config.session.async.queue_capacity = 2;
+
+    if (!async_publisher.Open(async_config).Succeed() ||
+        async_publisher.State() != PublisherState::WaitingForKeyframe ||
+        !IsPublishFailure(async_publisher.Publish(MakeVideoPacket(true)),
+                          PusherErrorCategory::InvalidState)) {
+        std::cerr << "Publisher did not enforce asynchronous mode" << std::endl;
+        return 1;
+    }
+
+    if (!async_publisher.Enqueue(MakeEncodedVideoPacket(true)).Accepted()) {
+        std::cerr << "Publisher did not enqueue an asynchronous packet" << std::endl;
+        return 1;
+    }
+    for (int i = 0; i < 100 && async_scripted->push_calls == 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (async_scripted->push_calls != 1 ||
+        async_publisher.State() != PublisherState::Running ||
+        !async_publisher.Close().Succeed()) {
+        std::cerr << "Publisher did not complete asynchronous output" << std::endl;
         return 1;
     }
 

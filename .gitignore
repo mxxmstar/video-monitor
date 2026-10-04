@@ -40,6 +40,7 @@ src-cpp/*.pdb
 build-vs/*
 build-ninja*/*
 build/*
+build-*
 .vs/*
 .vscode/*
 

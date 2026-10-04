@@ -2,6 +2,7 @@
 
 #include <memory>
 
+#include "media/pusher/async_pusher_session.h"
 #include "media/publisher/publisher_config.h"
 
 /// @brief Publisher 的对外状态。
@@ -18,8 +19,8 @@ enum class PublisherState {
 
 /// @brief 发布门面。
 ///
-/// Publisher 是应用 Pipeline 的输出入口：它选择发布类型、持有一次
-/// PusherSession，并提供统一 Open/Publish/Close 接口。它不调用 FFmpeg API，
+/// Publisher 是应用 Pipeline 的输出入口：它根据配置在同步和异步两种
+/// Session 中直接选择其一，并提供统一 Open/Publish/Close 接口。它不调用 FFmpeg API，
 /// 不实现关键帧等待、重连或时间戳换算；这些分别由 PusherSession 和 Pusher
 /// 负责，从而保证上层不会与具体输出协议耦合。
 class Publisher {
@@ -27,8 +28,10 @@ public:
     /// @brief 创建默认的 FFmpeg 文件发布门面。
     Publisher();
 
-    /// @brief 注入 Session，供单元测试和后续 Publisher 工厂使用。
+    /// @brief 注入同步 Session
     explicit Publisher(std::unique_ptr<PusherSession> session);
+    /// @brief 注入异步 Session
+    explicit Publisher(std::unique_ptr<AsyncPusherSession> session);
     ~Publisher();
 
     Publisher(const Publisher&) = delete;
@@ -39,6 +42,9 @@ public:
 
     /// @brief 发布一个已经编码的媒体包。
     PusherPublishResult Publish(const MediaPacket& packet);
+
+    /// @brief 将一个已经编码的媒体包交给异步 Session 的有界队列。
+    PusherEnqueueResult Enqueue(const MediaPacket& packet);
 
     /// @brief 幂等结束当前发布任务。
     PusherResult Close();
@@ -52,5 +58,8 @@ public:
 private:
     static PusherError MakeError(PusherErrorCategory category, const char* message);
 
+    // 按 Open() 的配置惰性创建，避免为未选中的 Session 启动事件线程。
     std::unique_ptr<PusherSession> session_;
+    std::unique_ptr<AsyncPusherSession> async_session_;
+    PusherSessionMode active_mode_{PusherSessionMode::Synchronous};
 };

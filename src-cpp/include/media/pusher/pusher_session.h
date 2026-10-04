@@ -4,6 +4,7 @@
 #include <optional>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <condition_variable>
 #include <mutex>
@@ -20,6 +21,23 @@ enum class PusherTimestampMode {
 enum class PusherTimestampEpochScope {
     Session,     ///< 自动重连后沿用本次会话中的原 epoch，保持逻辑时间连续
     Connection,  ///< 自动重连后推流器以新连接的首包重新建立 epoch，即时间轴从零开始计时
+};
+
+/// @brief 选择一次输出会话的写入模式。
+enum class PusherSessionMode {
+    Synchronous,  ///< Publish() 在调用线程中完成底层写入
+    Asynchronous, ///< Enqueue() 交给 Session 内部的写入线程
+};
+
+/// @brief 异步 Session 关闭时对待发包的处理方式。
+enum class PusherAsyncCloseMode {
+    Discard, ///< 立即丢弃待发包，适合实时网络输出
+    Drain,   ///< 先写完已入队的包，再关闭输出
+};
+
+struct PusherAsyncConfig {
+    std::size_t queue_capacity{64}; ///< 待发包数量上限
+    PusherAsyncCloseMode close_mode{PusherAsyncCloseMode::Discard};
 };
 
 struct PusherTimestampPolicy {
@@ -55,10 +73,18 @@ enum class PusherSessionState {
 /// 仍由 PusherConfig 持有。
 struct PusherSessionConfig {
     PusherConfig pusher;
+    PusherSessionMode mode{PusherSessionMode::Synchronous};
+    PusherAsyncConfig async;
     PusherTimestampPolicy timestamp_policy;
     PusherReconnectPolicy reconnect_policy;
 
-    bool is_valid() const { return pusher.is_valid(); }
+    bool is_valid() const {
+        const bool valid_mode = mode == PusherSessionMode::Synchronous ||
+                                mode == PusherSessionMode::Asynchronous;
+        return valid_mode && pusher.is_valid() &&
+               (mode != PusherSessionMode::Asynchronous ||
+                async.queue_capacity > 0);
+    }
 };
 
 /// @brief 一次 Publish 调用的结果状态。
