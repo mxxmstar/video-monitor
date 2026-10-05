@@ -190,7 +190,7 @@ PullServer 还需要解决：
 | FFmpeg 支持该协议，但需要专用连接参数 | FFmpeg 输出 options，不新增 Pusher 子类 |
 | 不再通过 FFmpeg 写出，使用独立网络库发送单个目标 | 新增 `IPusher` 实现 |
 | 需要监听端口、管理多个客户端和 RTP/RTCP | 新增 PullServer/Protocol/ClientSession 路线 |
-| 同时发布到多个目标 | 后续新增 `MultiPublisher` 或统一多目标编排层 |
+| 同时发布到多个目标 | `Publisher` 持有多个独立的 `PusherSession` / `AsyncPusherSession` |
 | 主备切换或统一健康检查 | 后续新增 Publisher 装饰器或管理层 |
 
 核心原则是：
@@ -707,7 +707,7 @@ initial_delay、max_delay、multiplier 和 reset_after_stable。
 ## 9. 边界收敛项（2026-09-19 追加）
 
 本节固化网络推流基线之后的接口约束。以下工作不改变 PushClient 与
-PullServer 的分界：`PublisherKind::Client` 继续表示主动向单一目标输出，
+PullServer 的分界：`PublisherKind::Client` 继续表示主动向目标输出，
 `PublisherKind::Server` 留给后续监听端口和服务多个播放客户端的独立路线。
 ZLMediaKit 是 Client 的远端目标，不是新的 Publisher 类型。
 
@@ -795,6 +795,25 @@ Pusher 调用 `Close/Open`，也不能由事件回调直接修改 Publisher 状�
 Session 时先停止监控并注销事件来源，再等待该 Session 的 I/O 和资源清理，
 避免 watchdog 持有失效的 Session 引用。写入执行者与共享 watchdog 分离；
 是否使用独立写入线程或共享执行器由后续队列方案确定。
+
+### 9.2.1 多 Session Publisher（当前阶段）
+
+`PublisherConfig::targets` 配置一个或多个带唯一 `target_id` 的输出目标；每个目标
+拥有独立的 `PusherSessionConfig`、Pusher 和状态。当前同一 Publisher 内所有目标
+必须采用相同的 `PusherSessionMode`：同步模式的 `Publish()` 广播到每个目标，
+异步模式的 `Enqueue()` 分别交给各目标自己的 `AsyncPusherSession` 有界队列。
+同步写入时 `FFmpegPusher` 为每个目标引用一份独立 AVPacket；Muxer 仍消费其收到的
+包，上游原包可供后续目标使用。
+单个目标失败不阻止其余目标接收本次包；聚合结果返回首个失败目标的 ID，
+`LastPublishResults()` / `LastEnqueueResults()` 和 `TargetStates()` 保留逐目标结果。
+混合模式及动态增删目标留待专门设计调用语义后实现。
+
+`Open()` 逐个打开目标，失败时关闭本次已打开的目标；`Close()` 和
+`RequestStop()` 对所有目标执行，即使其中一个失败也继续处理其余目标。
+所有目标运行时整体为 `Running`，任一目标失败或关闭失败时整体为 `Failed`；
+各目标状态和重连仍互相独立。当前只有 Client 路线，Server 路线不复用
+这一组 PusherSession。本阶段不实现 Publisher 级 watchdog；9.2 所述共享
+watchdog 是后续演进方向。
 
 ### 9.3 Packet 所有权与重试
 

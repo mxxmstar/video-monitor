@@ -227,8 +227,11 @@ int main() {
 
     const std::filesystem::path output_path =
         std::filesystem::current_path() / "ffmpeg_timestamp_normalization_test.mp4";
+    const std::filesystem::path second_output_path =
+        std::filesystem::current_path() / "ffmpeg_timestamp_second_output_test.mp4";
     std::error_code remove_error;
     std::filesystem::remove(output_path, remove_error);
+    std::filesystem::remove(second_output_path, remove_error);
 
     // 使用真实编码包经过 Publisher 写入。实际链路为：
     // Publisher -> PusherSession -> FFmpegPusher -> FFmpegMuxer。
@@ -236,10 +239,14 @@ int main() {
     // 时间轴归零，以及 Close() 会写出可读取的尾部。
     PublisherConfig publisher_config;
     publisher_config.kind = PublisherKind::Client;
-    publisher_config.session.pusher.output_url = output_path.string();
-    publisher_config.session.pusher.video_track =
+    publisher_config.targets.push_back({"output", {}});
+    publisher_config.targets[0].session.pusher.output_url = output_path.string();
+    publisher_config.targets[0].session.pusher.video_track =
         MakeMuxerConfig(encoder.GetOutputInfo());
-    publisher_config.session.timestamp_policy.mode = PusherTimestampMode::StartAtZero;
+    publisher_config.targets[0].session.timestamp_policy.mode = PusherTimestampMode::StartAtZero;
+    publisher_config.targets.push_back(publisher_config.targets.front());
+    publisher_config.targets[1].target_id = "second";
+    publisher_config.targets[1].session.pusher.output_url = second_output_path.string();
 
     Publisher publisher;
     const PusherResult open_result = publisher.Open(publisher_config);
@@ -253,6 +260,10 @@ int main() {
     }
     int published_packet_count = 0;
     for (const auto& packet : packets) {
+        const auto* source = static_cast<const AVPacket*>(packet->backend.ptr);
+        const auto* original_data = source->data;
+        const auto original_size = source->size;
+        const auto original_pts = source->pts;
         const PusherPublishResult publish_result = publisher.Publish(*packet);
         if (!publish_result.Succeed() || !publish_result.WasPublished()) {
             std::cerr << "Failed to publish timestamp test packet: "
@@ -260,6 +271,12 @@ int main() {
                               ? publish_result.error->message
                               : "packet was unexpectedly dropped")
                       << std::endl;
+            publisher.Close();
+            return 1;
+        }
+        if (source->data != original_data || source->size != original_size ||
+            source->pts != original_pts) {
+            std::cerr << "Publisher consumed or modified the upstream AVPacket" << std::endl;
             publisher.Close();
             return 1;
         }
@@ -279,8 +296,10 @@ int main() {
         return 1;
     }
 
-    const bool normalized = VerifyLocalFileTimeline(output_path);
+    const bool normalized = VerifyLocalFileTimeline(output_path) &&
+                            VerifyLocalFileTimeline(second_output_path);
     std::filesystem::remove(output_path, remove_error);
+    std::filesystem::remove(second_output_path, remove_error);
     if (!normalized) {
         std::cerr << "Local output timeline, duration, frame count, or frame rate is invalid"
                   << std::endl;

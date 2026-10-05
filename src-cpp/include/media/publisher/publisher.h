@@ -1,6 +1,8 @@
 #pragma once
 
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "media/pusher/async_pusher_session.h"
 #include "media/publisher/publisher_config.h"
@@ -19,8 +21,8 @@ enum class PublisherState {
 
 /// @brief 发布门面。
 ///
-/// Publisher 是应用 Pipeline 的输出入口：它根据配置在同步和异步两种
-/// Session 中直接选择其一，并提供统一 Open/Publish/Close 接口。它不调用 FFmpeg API，
+/// Publisher 是应用 Pipeline 的输出入口：它按配置管理多个同模式 Session，
+/// 并提供统一 Open/Publish/Enqueue/Close 接口。它不调用 FFmpeg API，
 /// 不实现关键帧等待、重连或时间戳换算；这些分别由 PusherSession 和 Pusher
 /// 负责，从而保证上层不会与具体输出协议耦合。
 class Publisher {
@@ -32,6 +34,8 @@ public:
     explicit Publisher(std::unique_ptr<PusherSession> session);
     /// @brief 注入异步 Session
     explicit Publisher(std::unique_ptr<AsyncPusherSession> session);
+    explicit Publisher(std::vector<std::unique_ptr<PusherSession>> sessions);
+    explicit Publisher(std::vector<std::unique_ptr<AsyncPusherSession>> sessions);
     ~Publisher();
 
     Publisher(const Publisher&) = delete;
@@ -55,11 +59,37 @@ public:
     /// @brief 请求结束当前发布任务。
     PusherResult RequestStop();
 
+    struct TargetState {
+        std::string target_id;
+        PusherSessionState state;
+    };
+    struct TargetPublishResult {
+        std::string target_id;
+        PusherPublishResult result;
+    };
+    struct TargetEnqueueResult {
+        std::string target_id;
+        PusherEnqueueResult result;
+    };
+
+    std::vector<TargetState> TargetStates() const;
+    const std::vector<TargetPublishResult>& LastPublishResults() const noexcept { return last_publish_results_; }
+    const std::vector<TargetEnqueueResult>& LastEnqueueResults() const noexcept { return last_enqueue_results_; }
+
 private:
     static PusherError MakeError(PusherErrorCategory category, const char* message);
+    static PusherError ErrorWithTarget(PusherError error, const std::string& target_id);
 
-    // 按 Open() 的配置惰性创建，避免为未选中的 Session 启动事件线程。
-    std::unique_ptr<PusherSession> session_;
-    std::unique_ptr<AsyncPusherSession> async_session_;
+    struct SessionEntry {
+        std::string target_id;
+        std::unique_ptr<PusherSession> synchronous;
+        std::unique_ptr<AsyncPusherSession> asynchronous;
+    };
+    std::vector<SessionEntry> sessions_;
+    std::vector<TargetPublishResult> last_publish_results_; ///< 最近一次发布结果
+    std::vector<TargetEnqueueResult> last_enqueue_results_; ///< 最近一次 Enqueue 结果
+    bool injected_sessions_{false};
+    bool opened_{false};
+    bool close_failed_{false};
     PusherSessionMode active_mode_{PusherSessionMode::Synchronous};
 };

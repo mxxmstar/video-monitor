@@ -1,6 +1,7 @@
 #include "media/publisher/publisher.h"
 #include "media/ffmpeg_packet_buffer.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <iostream>
@@ -35,8 +36,9 @@ PusherConfig MakeValidPusherConfig() {
 PublisherConfig MakeValidPublisherConfig() {
     PublisherConfig config;
     config.kind = PublisherKind::Client;
-    config.session.pusher = MakeValidPusherConfig();
-    config.session.reconnect_policy.enabled = false;
+    config.targets.push_back({"primary", {}});
+    config.targets[0].session.pusher = MakeValidPusherConfig();
+    config.targets[0].session.reconnect_policy.enabled = false;
     return config;
 }
 
@@ -77,6 +79,10 @@ class ScriptedPusher final : public IPusher {
 public:
     PusherResult Open(const PusherConfig& config) override {
         ++open_calls;
+        if (fail_next_open) {
+            fail_next_open = false;
+            return PusherResult::Failed(MakeError(PusherErrorCategory::OpenFailed, "scripted open failed"));
+        }
         if (!config.is_valid()) {
             return PusherResult::Failed(MakeError(
                 PusherErrorCategory::InvalidConfiguration,
@@ -106,18 +112,25 @@ public:
     PusherResult Close() override {
         ++close_calls;
         opened = false;
+        if (fail_next_close) {
+            fail_next_close = false;
+            return PusherResult::Failed(MakeError(PusherErrorCategory::CloseFailed, "scripted close failed"));
+        }
         return PusherResult::Success();
     }
 
     bool IsOpen() const override { return opened; }
 
-    PusherResult RequestStop() override { return PusherResult::Success(); }
+    PusherResult RequestStop() override { ++stop_calls; return PusherResult::Success(); }
 
-    int open_calls{0};
-    int push_calls{0};
-    int close_calls{0};
+    std::atomic<int> open_calls{0};
+    std::atomic<int> push_calls{0};
+    std::atomic<int> close_calls{0};
+    std::atomic<int> stop_calls{0};
     bool opened{false};
     bool fail_next_push{false};
+    bool fail_next_open{false};
+    bool fail_next_close{false};
     bool last_packet_was_keyframe{false};
 };
 
@@ -201,8 +214,8 @@ int main() {
         std::make_unique<PusherSession>(std::move(async_scripted_pusher)));
     Publisher async_publisher(std::move(async_session));
     PublisherConfig async_config = MakeValidPublisherConfig();
-    async_config.session.mode = PusherSessionMode::Asynchronous;
-    async_config.session.async.queue_capacity = 2;
+    async_config.targets[0].session.mode = PusherSessionMode::Asynchronous;
+    async_config.targets[0].session.async.queue_capacity = 2;
 
     if (!async_publisher.Open(async_config).Succeed() ||
         async_publisher.State() != PublisherState::WaitingForKeyframe ||
@@ -223,6 +236,103 @@ int main() {
         async_publisher.State() != PublisherState::Running ||
         !async_publisher.Close().Succeed()) {
         std::cerr << "Publisher did not complete asynchronous output" << std::endl;
+        return 1;
+    }
+
+    PublisherConfig invalid = MakeValidPublisherConfig();
+    if (invalid.targets.empty() || !invalid.is_valid()) return 1;
+    invalid.targets.push_back(invalid.targets.front());
+    if (invalid.is_valid()) {
+        std::cerr << "Publisher accepted duplicate target IDs" << std::endl;
+        return 1;
+    }
+    invalid.targets[1].target_id = "secondary";
+    invalid.targets[1].session.mode = PusherSessionMode::Asynchronous;
+    if (invalid.is_valid()) {
+        std::cerr << "Publisher accepted mixed session modes" << std::endl;
+        return 1;
+    }
+
+    PublisherConfig multi_config = MakeValidPublisherConfig();
+    multi_config.targets.push_back(multi_config.targets.front());
+    multi_config.targets[1].target_id = "secondary";
+    multi_config.targets[1].session.pusher.output_url = "secondary-output.mp4";
+
+    auto first_pusher = std::make_unique<ScriptedPusher>();
+    auto second_pusher = std::make_unique<ScriptedPusher>();
+    auto* first = first_pusher.get();
+    auto* second = second_pusher.get();
+    std::vector<std::unique_ptr<PusherSession>> sync_sessions;
+    sync_sessions.push_back(std::make_unique<PusherSession>(std::move(first_pusher)));
+    sync_sessions.push_back(std::make_unique<PusherSession>(std::move(second_pusher)));
+    Publisher multi(std::move(sync_sessions));
+    if (!multi.Open(multi_config).Succeed() ||
+        !multi.Publish(MakeVideoPacket(true)).WasPublished() ||
+        first->push_calls != 1 || second->push_calls != 1 ||
+        multi.TargetStates().size() != 2 || multi.State() != PublisherState::Running) {
+        std::cerr << "Publisher did not broadcast to both synchronous sessions" << std::endl;
+        return 1;
+    }
+    first->fail_next_push = true;
+    const auto partial = multi.Publish(MakeVideoPacket(false));
+    if (!IsPublishFailure(partial, PusherErrorCategory::WriteFailed) ||
+        partial.error->message.find("primary") == std::string::npos ||
+        second->push_calls != 2 || multi.State() != PublisherState::Failed ||
+        multi.TargetStates()[1].state != PusherSessionState::Running ||
+        multi.LastPublishResults().size() != 2 ||
+        !multi.LastPublishResults()[1].result.WasPublished()) {
+        std::cerr << "Publisher did not isolate a synchronous target failure" << std::endl;
+        return 1;
+    }
+    if (!multi.RequestStop().Succeed() || first->stop_calls == 0 || second->stop_calls == 0 ||
+        !multi.Close().Succeed()) {
+        std::cerr << "Publisher did not stop and close all targets" << std::endl;
+        return 1;
+    }
+
+    second->fail_next_open = true;
+    const auto failed_open = multi.Open(multi_config);
+    if (failed_open.Succeed() || failed_open.error->message.find("secondary") == std::string::npos ||
+        first->open_calls != 2 || first->close_calls != 2 ||
+        multi.State() != PublisherState::Closed) {
+        std::cerr << "Publisher did not roll back a partial Open" << std::endl;
+        return 1;
+    }
+    if (!multi.Open(multi_config).Succeed()) return 1;
+    first->fail_next_close = true;
+    const auto failed_close = multi.Close();
+    if (failed_close.Succeed() || failed_close.error->message.find("primary") == std::string::npos ||
+        second->close_calls != 3 || multi.State() != PublisherState::Failed) {
+        std::cerr << "Publisher did not close remaining targets after a close failure" << std::endl;
+        return 1;
+    }
+
+    auto async_first_pusher = std::make_unique<ScriptedPusher>();
+    auto async_second_pusher = std::make_unique<ScriptedPusher>();
+    auto* async_first = async_first_pusher.get();
+    auto* async_second = async_second_pusher.get();
+    std::vector<std::unique_ptr<AsyncPusherSession>> async_sessions;
+    async_sessions.push_back(std::make_unique<AsyncPusherSession>(
+        std::make_unique<PusherSession>(std::move(async_first_pusher))));
+    async_sessions.push_back(std::make_unique<AsyncPusherSession>(
+        std::make_unique<PusherSession>(std::move(async_second_pusher))));
+    Publisher multi_async(std::move(async_sessions));
+    for (auto& target : multi_config.targets) {
+        target.session.mode = PusherSessionMode::Asynchronous;
+        target.session.async.queue_capacity = 2;
+    }
+    if (!multi_async.Open(multi_config).Succeed() ||
+        !multi_async.Enqueue(MakeEncodedVideoPacket(true)).Accepted() ||
+        multi_async.LastEnqueueResults().size() != 2) {
+        std::cerr << "Publisher did not enqueue to both asynchronous sessions" << std::endl;
+        return 1;
+    }
+    for (int i = 0; i < 200 && (async_first->push_calls == 0 || async_second->push_calls == 0); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (async_first->push_calls != 1 || async_second->push_calls != 1 ||
+        multi_async.State() != PublisherState::Running || !multi_async.Close().Succeed()) {
+        std::cerr << "Publisher did not write both asynchronous targets" << std::endl;
         return 1;
     }
 

@@ -1,5 +1,10 @@
 #pragma once
 
+#include <algorithm>
+#include <string>
+#include <unordered_set>
+#include <vector>
+
 #include "media/pusher/pusher_session.h"
 
 /// @brief 发布目标类型。
@@ -14,15 +19,28 @@ enum class PublisherKind {
 
 /// @brief 对上层暴露的一次发布任务配置。
 ///
-/// PublisherConfig 的职责是选择发布路线，并持有该路线通用的会话配置。
+/// PublisherConfig 的职责是选择发布路线，并配置各个独立的输出会话。
 /// 输出地址、容器格式和音视频轨道参数已属于具体输出目标，因此由
 /// PusherSessionConfig::pusher（即 PusherConfig）持有，不能在这里重复保存。
+struct PublisherTargetConfig {
+    std::string target_id;
+    PusherSessionConfig session;
+};
+
 struct PublisherConfig {
     PublisherKind kind{PublisherKind::Client};
-    PusherSessionConfig session;
+    std::vector<PublisherTargetConfig> targets;
 
     /// @brief 校验当前 Publisher 是否能创建所选路线及其会话。
     bool is_valid() const {
-        return session.is_valid();
+        if (kind != PublisherKind::Client || targets.empty()) {
+            return false;
+        }
+        std::unordered_set<std::string> ids;
+        const auto mode = targets.front().session.mode;
+        return std::all_of(targets.begin(), targets.end(), [&](const PublisherTargetConfig& target) {
+            return !target.target_id.empty() && ids.insert(target.target_id).second &&
+                   target.session.mode == mode && target.session.is_valid();
+        });
     }
 };

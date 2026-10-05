@@ -1,10 +1,16 @@
 #include "media/pusher/ffmpeg_pusher.h"
+#include "media/ffmpeg_packet_buffer.h"
 
 #include <algorithm>
 #include <cerrno>
 #include <cctype>
 #include <cstring>
+#include <memory>
 #include <utility>
+
+extern "C" {
+#include <libavcodec/packet.h>
+}
 
 namespace {
 
@@ -301,11 +307,15 @@ PusherResult FFmpegPusher::Push(const MediaPacket& packet) {
         return MakeFailure(PusherErrorCategory::InvalidPacket, "Invalid AVPacket payload or duration");
     }
 
-    // FFmpegMuxer 使用消费式写入：成功进入 av_interleaved_write_frame()
-    // 后，packet.backend.ptr 指向的 AVPacket 不能再被当前调用方重试或复用。
-    // 未来 PusherSession 遇到写失败时必须等待下一关键帧，或将 Muxer 改为
-    // 非消费式写入后再实现重试。
-    const auto result = muxer_.Write(packet);
+    // Muxer 消费 AVPacket；每个目标写入自己的引用，不改写上游和其他目标的包。
+    AVPacket* writable_packet = av_packet_clone(av_packet);
+    if (!writable_packet) {
+        return MakeFailure(PusherErrorCategory::Internal, "Could not clone AVPacket for output");
+    }
+    MediaPacket writable = packet;
+    writable.buffer = std::make_shared<FFmpegPacketBuffer>(writable_packet);
+    writable.backend.ptr = writable_packet;
+    const auto result = muxer_.Write(writable);
     if (!result.Succeed()) {
         opened_ = false;
         return MapMuxerError(*result.error, network_output_);

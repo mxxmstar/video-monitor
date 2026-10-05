@@ -618,9 +618,10 @@ int RunFfmpegPullerDecoderConverterEncoderTest() {
     const std::string output_file = "test.mp4";
     PublisherConfig publisher_config;
     publisher_config.kind = PublisherKind::Client;
-    publisher_config.session.pusher.output_url = output_file;
-    publisher_config.session.pusher.video_track = muxer_config;
-    publisher_config.session.timestamp_policy.mode = PusherTimestampMode::StartAtZero;
+    publisher_config.targets.push_back({"output", {}});
+    publisher_config.targets[0].session.pusher.output_url = output_file;
+    publisher_config.targets[0].session.pusher.video_track = muxer_config;
+    publisher_config.targets[0].session.timestamp_policy.mode = PusherTimestampMode::StartAtZero;
     const PusherResult session_open_result = publisher.Open(publisher_config);
     if (!session_open_result.Succeed()) {
         LOG_ERROR("Failed to open publisher for {}: {}", output_file,
@@ -982,11 +983,12 @@ int RunFfmpegPullerDecoderConverterEncoderPushTest() {
     const std::string output_file = kRtspPushOutputUrl;
     PublisherConfig publisher_config;
     publisher_config.kind = PublisherKind::Client;
-    publisher_config.session.pusher.output_url = output_file;
-    publisher_config.session.pusher.video_track = muxer_config;
-    publisher_config.session.timestamp_policy.mode = PusherTimestampMode::Preserved;
+    publisher_config.targets.push_back({"output", {}});
+    publisher_config.targets[0].session.pusher.output_url = output_file;
+    publisher_config.targets[0].session.pusher.video_track = muxer_config;
+    publisher_config.targets[0].session.timestamp_policy.mode = PusherTimestampMode::Preserved;
     // Explicitly exercise the Pusher-owned RTSP option resolution path.
-    publisher_config.session.pusher.ffmpeg.rtsp = RtspOutputOptions{"tcp"};
+    publisher_config.targets[0].session.pusher.ffmpeg.rtsp = RtspOutputOptions{"tcp"};
     const PusherResult session_open_result = publisher.Open(publisher_config);
     if (!session_open_result.Succeed()) {
         LOG_ERROR("Failed to open publisher for {}: {}", output_file,
