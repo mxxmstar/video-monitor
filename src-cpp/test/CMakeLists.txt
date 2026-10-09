@@ -38,3 +38,7 @@ endforeach()
 if(BUILD_MEDIA_TESTS)
     add_subdirectory(media)
 endif()
+
+if(BUILD_RENDER)
+    add_subdirectory(render)
+endif()
