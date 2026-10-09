@@ -43,16 +43,18 @@ if(EXISTS "${RAW_FRAME_CONTRACT_TEST}")
     )
     target_link_libraries(test_media_raw_frame_contract
         PRIVATE
-            "${FFMPEG_LIB_DIR}/avutil.lib"
+            "${FFMPEG_avutil_LIBRARY}"
     )
     set_target_properties(test_media_raw_frame_contract PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/tests"
     )
-    add_custom_command(TARGET test_media_raw_frame_contract POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${FFMPEG_ROOT}/bin/avutil-60.dll"
-            "$<TARGET_FILE_DIR:test_media_raw_frame_contract>"
-    )
+    if(WIN32)
+        add_custom_command(TARGET test_media_raw_frame_contract POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${FFMPEG_ROOT}/bin/avutil-60.dll"
+                "$<TARGET_FILE_DIR:test_media_raw_frame_contract>"
+        )
+    endif()
     add_test(NAME test_media_raw_frame_contract
         COMMAND test_media_raw_frame_contract
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}

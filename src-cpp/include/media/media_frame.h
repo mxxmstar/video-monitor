@@ -114,7 +114,7 @@ public:
     }
 
     /// @brief 获取像素格式
-    PixelFormat PixelFormat() const {
+    ::PixelFormat PixelFormat() const {
         if (auto* v = VideoMeta()) return v->pixel_format;
         return PixelFormat::kUnknown;
     }

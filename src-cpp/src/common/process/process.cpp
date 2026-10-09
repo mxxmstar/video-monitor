@@ -232,7 +232,7 @@ private:
     static std::vector<std::string> MakeTerminalCommand(const ProcessOptions& options) {
         std::vector<std::string> command;
         command.push_back(options.executable.string());
-        command.insert(command.end(), options.arguments.begin(), options.arguments.end());
+        command.insert(command.end(), options.args.begin(), options.args.end());
         return command;
     }
 
@@ -243,27 +243,27 @@ private:
 
         if (std::filesystem::exists("/usr/bin/xterm")) {
             terminal_options.executable = "/usr/bin/xterm";
-            terminal_options.arguments = {"-T", title, "-e"};
-            terminal_options.arguments.insert(
-                terminal_options.arguments.end(), command.begin(), command.end());
+            terminal_options.args = {"-T", title, "-e"};
+            terminal_options.args.insert(
+                terminal_options.args.end(), command.begin(), command.end());
             terminal_options.terminal_mode = TerminalMode::None;
             return terminal_options;
         }
 
         if (std::filesystem::exists("/usr/bin/gnome-terminal")) {
             terminal_options.executable = "/usr/bin/gnome-terminal";
-            terminal_options.arguments = {"--title", title, "--"};
-            terminal_options.arguments.insert(
-                terminal_options.arguments.end(), command.begin(), command.end());
+            terminal_options.args = {"--title", title, "--"};
+            terminal_options.args.insert(
+                terminal_options.args.end(), command.begin(), command.end());
             terminal_options.terminal_mode = TerminalMode::None;
             return terminal_options;
         }
 
         if (std::filesystem::exists("/usr/bin/konsole")) {
             terminal_options.executable = "/usr/bin/konsole";
-            terminal_options.arguments = {"--title", title, "-e"};
-            terminal_options.arguments.insert(
-                terminal_options.arguments.end(), command.begin(), command.end());
+            terminal_options.args = {"--title", title, "-e"};
+            terminal_options.args.insert(
+                terminal_options.args.end(), command.begin(), command.end());
             terminal_options.terminal_mode = TerminalMode::None;
             return terminal_options;
         }

@@ -5,6 +5,7 @@
 #include <map>
 #include "media/media_packet.h"
 #include <variant>
+#include <optional>
 
 
 /// @brief 视频轨道信息
