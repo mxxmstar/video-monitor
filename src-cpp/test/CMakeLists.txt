@@ -97,4 +97,6 @@ if(BUILD_INFERENCE AND BUILD_INFERENCE_TESTS)
         COMMAND test_sync_inference
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     )
+    add_test(NAME test_sync_inference_detection_boxes
+        COMMAND test_sync_inference --test-detection-boxes)
 endif()

@@ -6,7 +6,12 @@
 #include <atomic>
 #include <chrono>
 #include <thread>
+#include <array>
+#include <climits>
+#include <cmath>
 
+#include "media/ffmpeg_raw_frame_buffer.h"
+#include "render/osd/osd_render_impl.h"
 #include "engine/openvino_engine.h"
 #include "media/media_frame.h"
 #include "media/simple_buffer.h"
@@ -15,6 +20,11 @@
 #include "media/decoder/ffmpeg_decoder.h"
 #include "render/video/opengl_video_renderer.h"
 #include "common/log/logger.h"
+#include "render/osd/osd_render.h"
+extern "C" {
+#include <libavutil/frame.h>
+#include <libavutil/pixfmt.h>
+}
 
 #ifndef VIDEO_MONITOR_MODEL_ROOT
 #define VIDEO_MONITOR_MODEL_ROOT "."
@@ -67,6 +77,230 @@ MediaFrame MakeI420Frame(int width, int height) {
     frame.meta = meta;
     frame.buffer = std::make_shared<SimpleBuffer>(std::move(data));
     return frame;
+}
+
+template <typename View>
+void DrawDetectionBoxes(View& view, const FrameResult& result) {
+    constexpr int thickness = 2;
+    for (const auto& object : result.objects) {
+        const auto& rect = object.object.rect;
+        const double right = static_cast<double>(rect.x) + rect.width;
+        const double bottom = static_cast<double>(rect.y) + rect.height;
+        if (!std::isfinite(rect.x) || !std::isfinite(rect.y) ||
+            !std::isfinite(right) || !std::isfinite(bottom) || rect.width <= 0 || rect.height <= 0) {
+            continue;
+        }
+        const int x1 = static_cast<int>(std::floor(std::clamp<double>(rect.x, 0, view.width)));
+        const int y1 = static_cast<int>(std::floor(std::clamp<double>(rect.y, 0, view.height)));
+        const int x2 = static_cast<int>(std::ceil(std::clamp<double>(right, 0, view.width)));
+        const int y2 = static_cast<int>(std::ceil(std::clamp<double>(bottom, 0, view.height)));
+        if (x1 >= x2 || y1 >= y2) {
+            continue;
+        }
+        const int horizontal = std::min(thickness, y2 - y1);
+        const int vertical = std::min(thickness, x2 - x1);
+        const auto color = OsdColors::Yuv::kGreen;
+        FillTextRect(view, x1, y1, x2 - x1, horizontal, color);
+        FillTextRect(view, x1, y2 - horizontal, x2 - x1, horizontal, color);
+        FillTextRect(view, x1, y1, vertical, y2 - y1, color);
+        FillTextRect(view, x2 - vertical, y1, vertical, y2 - y1, color);
+    }
+}
+
+bool DrawDetectionBoxes(MediaFrame& frame, const FrameResult& result) {
+    if (result.objects.empty()) {
+        return true;
+    }
+    const auto* meta = frame.VideoMeta();
+    if (!meta || !frame.buffer || meta->width <= 0 || meta->height <= 0 || meta->width == INT_MAX || meta->height == INT_MAX) {
+        return false;
+    }
+    const bool planar = meta->pixel_format == PixelFormat::kI420;
+    if (!planar && meta->pixel_format != PixelFormat::kNV12 && meta->pixel_format != PixelFormat::kNV21) {
+        return false;
+    }
+    const int count = planar ? 3 : 2;
+    const int chroma_width = (meta->width + 1) / 2;
+    if (!planar && chroma_width > INT_MAX / 2) {
+        return false;
+    }
+    std::array<std::uint8_t*, 3> planes{};
+    std::array<std::size_t, 3> strides{};
+    auto* raw = dynamic_cast<FFmpegRawFrameBuffer*>(frame.buffer.get());
+    // Decoded raw frames may still share storage with the decoder's reference frames.
+    if (raw && (!raw->IsValid() || av_frame_make_writable(raw->GetFrame()) < 0)) {
+        return false;
+    }
+    for (int index = 0; index < count; ++index) {
+        const int row_bytes = index == 0 ? meta->width : chroma_width * (planar ? 1 : 2);
+        const int rows = index == 0 ? meta->height : (meta->height + 1) / 2;
+        const int stride = raw ? raw->PlaneStride(index) : frame.Stride(index);
+        if (stride < row_bytes) {
+            return false;
+        }
+        strides[index] = static_cast<std::size_t>(stride);
+        if (raw) {
+            planes[index] = raw->PlaneData(index);
+        } else {
+            if (!frame.buffer->IsContiguous() || !frame.buffer->Data() ||
+                meta->plane_count < count || frame.PlaneOffset(index) < 0) {
+                return false;
+            }
+            const auto offset = static_cast<std::size_t>(frame.PlaneOffset(index));
+            const auto required = strides[index] * (rows - 1) + row_bytes;
+            if (offset > frame.buffer->Size() || required > frame.buffer->Size() - offset) {
+                return false;
+            }
+            planes[index] = frame.buffer->Data() + offset;
+        }
+        if (!planes[index]) {
+            return false;
+        }
+    }
+    if (planar) {
+        I420View view{planes[0], planes[1], planes[2], meta->width, meta->height,
+                      strides[0], strides[1], strides[2]};
+        DrawDetectionBoxes(view, result);
+    } else {
+        Nv12View view{planes[0], planes[1], meta->width, meta->height,
+                      strides[0], strides[1], meta->pixel_format == PixelFormat::kNV21};
+        DrawDetectionBoxes(view, result);
+    }
+    return true;
+}
+
+bool DrawDetectionBoxes2(MediaFrame& frame, const FrameResult& result) {
+
+    osd::OverlayBatch batch;
+    auto textoverlay = std::make_shared<OverlayText>();
+    textoverlay->x = 100;
+    textoverlay->y = 100;
+    textoverlay->text = "Hello, World!";
+    textoverlay->scale = 5;
+    textoverlay->color = OsdColors::Yuv::kRed;
+    batch.Add(std::move(textoverlay));
+
+
+
+    const auto* meta = frame.VideoMeta();
+    if (!meta || !frame.buffer || meta->width <= 0 || meta->height <= 0 || meta->width == INT_MAX || meta->height == INT_MAX) {
+        return false;
+    }
+    if (meta->pixel_format != PixelFormat::kI420 &&
+        meta->pixel_format != PixelFormat::kNV12 &&
+        meta->pixel_format != PixelFormat::kNV21) {
+        return false;
+    }
+    
+    constexpr int thickness = 2;
+    for (const auto& object : result.objects) {
+        const auto& rect = object.object.rect;
+        const double right = static_cast<double>(rect.x) + rect.width;
+        const double bottom = static_cast<double>(rect.y) + rect.height;
+        if (!std::isfinite(rect.x) || !std::isfinite(rect.y) ||
+            !std::isfinite(right) || !std::isfinite(bottom) || rect.width <= 0 || rect.height <= 0) {
+            continue;
+        }
+        const int x1 = static_cast<int>(std::floor(std::clamp<double>(rect.x, 0, meta->width)));
+        const int y1 = static_cast<int>(std::floor(std::clamp<double>(rect.y, 0, meta->height)));
+        const int x2 = static_cast<int>(std::ceil(std::clamp<double>(right, 0, meta->width)));
+        const int y2 = static_cast<int>(std::ceil(std::clamp<double>(bottom, 0, meta->height)));
+        if (x1 >= x2 || y1 >= y2) {
+            continue;
+        }
+
+        auto overlay = std::make_shared<OverlayRect>();
+        overlay->x = x1;
+        overlay->y = y1;
+        overlay->width = x2 - x1;
+        overlay->height = y2 - y1;
+        overlay->color = OsdColors::Yuv::kGreen;
+        overlay->thickness = thickness;
+        batch.Add(std::move(overlay));
+    }
+
+
+
+
+
+    if (batch.Empty()) {
+        return true;
+    }
+
+    auto* raw = dynamic_cast<FFmpegRawFrameBuffer*>(frame.buffer.get());
+    if (raw && (!raw->IsValid() || av_frame_make_writable(raw->GetFrame()) < 0)) {
+        return false;
+    }
+
+    switch (meta->pixel_format) {
+    case PixelFormat::kI420:
+        return DrawOverlays<osd::I420OsdRenderer>(frame, batch) == OsdStatus::kOk;
+    case PixelFormat::kNV12:
+    case PixelFormat::kNV21:
+        return DrawOverlays<osd::Nv12OsdRenderer>(frame, batch) == OsdStatus::kOk;
+    default:
+        return false;
+    }
+}
+
+int TestDetectionBoxes() {
+    FrameResult result;
+    ObjectResult object;
+    object.object.rect = {4, 4, 12, 12};
+    result.objects.push_back(object);
+    auto packed = MakeI420Frame(24, 24);
+    auto* pixels = packed.buffer->Data();
+    if (!DrawDetectionBoxes(packed, result) ||
+        pixels[4 * 24 + 4] != OsdColors::Yuv::kGreen.y ||
+        pixels[15 * 24 + 15] != OsdColors::Yuv::kGreen.y ||
+        pixels[8 * 24 + 8] != 128 || pixels[0] != 128 ||
+        pixels[24 * 24 + 2 * 12 + 2] != OsdColors::Yuv::kGreen.u ||
+        pixels[24 * 24 + 12 * 12 + 2 * 12 + 2] != OsdColors::Yuv::kGreen.v) {
+        return 1;
+    }
+    result.objects[0].object.rect = {-4, -4, 12, 12};
+    if (!DrawDetectionBoxes(packed, result) || pixels[0] != OsdColors::Yuv::kGreen.y) {
+        return 1;
+    }
+    packed.buffer = std::make_shared<SimpleBuffer>(std::vector<std::uint8_t>(1));
+    if (DrawDetectionBoxes(packed, result)) {
+        return 1;
+    }
+
+    for (bool nv21 : {false, true}) {
+        AVFrame* av_frame = av_frame_alloc();
+        if (!av_frame) {
+            return 1;
+        }
+        auto buffer = std::make_shared<FFmpegRawFrameBuffer>(av_frame);
+        av_frame->format = nv21 ? AV_PIX_FMT_NV21 : AV_PIX_FMT_NV12;
+        av_frame->width = 24;
+        av_frame->height = 24;
+        if (av_frame_get_buffer(av_frame, 32) < 0) {
+            return 1;
+        }
+        for (int plane = 0; plane < 2; ++plane) {
+            std::memset(av_frame->data[plane], 128, av_frame->linesize[plane] * (plane == 0 ? 24 : 12));
+        }
+        AVFrame* reference = av_frame_clone(av_frame);
+        if (!reference) {
+            return 1;
+        }
+        auto raw = MakeI420Frame(24, 24);
+        std::get<VideoFrameMeta>(raw.meta).pixel_format = nv21 ? PixelFormat::kNV21 : PixelFormat::kNV12;
+        raw.buffer = buffer;
+        const bool drawn = DrawDetectionBoxes(raw, result);
+        const bool correct = drawn && buffer->PlaneData(0)[0] == OsdColors::Yuv::kGreen.y &&
+            buffer->PlaneData(1)[0] == (nv21 ? OsdColors::Yuv::kGreen.v : OsdColors::Yuv::kGreen.u) &&
+            buffer->PlaneData(1)[1] == (nv21 ? OsdColors::Yuv::kGreen.u : OsdColors::Yuv::kGreen.v) &&
+            reference->data[0][0] == 128 && reference->data[1][0] == 128;
+        av_frame_free(&reference);
+        if (!correct) {
+            return 1;
+        }
+    }
+    std::cout << "Detection box tests passed\n";
+    return 0;
 }
 
 int RunFfmpegPullerDecoderInferenceRendererTest() {
@@ -204,6 +438,12 @@ int RunFfmpegPullerDecoderInferenceRendererTest() {
         ++inferred_frames;
         LOG_INFO("Frame {} inference completed, objects={}", decoded_frames, result.objects.size());
 
+        if (!DrawDetectionBoxes2(*frame, result)) {
+            LOG_ERROR("Drawing detection boxes failed for frame {}: invalid or unsupported YUV plane layout",
+                      decoded_frames);
+            return;
+        }
+
         if (renderer.Render(*frame)) {
             ++rendered_frames;
         } else {
@@ -303,6 +543,9 @@ int RunFfmpegPullerDecoderInferenceRendererTest() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--test-detection-boxes") {
+        return TestDetectionBoxes();
+    }
     return RunFfmpegPullerDecoderInferenceRendererTest();
 }
